@@ -26,8 +26,8 @@ string RawNamedStringParameter(const named_parameter_map_t &parameters, const st
 	return entry->second.GetValue<string>();
 }
 
-RawParseOptions RawBindParseOptions(const named_parameter_map_t &parameters) {
-	auto options = ResolveTransform(RawNamedStringParameter(parameters, "transform"),
+RawParseOptions RawBindParseOptions(ClientContext &context, const named_parameter_map_t &parameters) {
+	auto options = ResolveTransform(context, RawNamedStringParameter(parameters, "transform"),
 	                                RawNamedStringParameter(parameters, "explode"));
 	auto ignore_entry = parameters.find("ignore_errors");
 	if (ignore_entry != parameters.end() && !ignore_entry->second.IsNull()) {
@@ -49,7 +49,7 @@ static unique_ptr<FunctionData> RawRecordsBind(ClientContext &context, TableFunc
 		throw InvalidInputException("RawDuck: payload may not be NULL");
 	}
 	auto payload_str = input.inputs[0].GetValue<string>();
-	result->parsed = RawParsedPayload::Process(payload_str, RawBindParseOptions(input.named_parameters));
+	result->parsed = RawParsedPayload::Process(payload_str, RawBindParseOptions(context, input.named_parameters));
 	if (result->parsed->columns.empty()) {
 		// empty payload: keep a valid (empty) result shape
 		return_types.push_back(LogicalType::JSON());

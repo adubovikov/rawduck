@@ -21,6 +21,7 @@ set(EXTENSION_SOURCES
     src/raw_records.cpp
     src/raw_ingest.cpp
     src/raw_attach.cpp
+    src/raw_transforms.cpp
     src/raw_optimize.cpp
     src/raw_scalars.cpp)
 

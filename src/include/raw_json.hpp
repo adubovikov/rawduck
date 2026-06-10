@@ -89,9 +89,11 @@ struct RawParsedPayload {
 	                                            const RawParseOptions &options = RawParseOptions());
 };
 
-// Resolves a transform name from the RawTree transform catalog (or a generic
-// dotted explode path) into parse options.
-RawParseOptions ResolveTransform(const string &transform, const string &explode);
+// Built-in ingest-time transforms (name -> dotted explode path); users can
+// register additional ones via raw_transform_define().
+const vector<pair<string, string>> &RawBuiltinTransforms();
+bool ResolveBuiltinTransform(const string &name, string &path);
+RawParseOptions RawExplodeOptions(const string &path);
 
 RawScalarKind JoinScalarKinds(RawScalarKind a, RawScalarKind b);
 RawScalarKind SniffScalarKind(duckdb_yyjson::yyjson_val *val);

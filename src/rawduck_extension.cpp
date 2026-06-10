@@ -18,6 +18,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(GetRawOptimizeFunction());
 	loader.RegisterFunction(GetRawTypeFunction());
 	loader.RegisterFunction(GetRawInferFunction());
+	loader.RegisterFunction(GetRawTransformsFunction());
+	loader.RegisterFunction(GetRawTransformDefineFunction());
 
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	// observe pushed-down predicates to drive raw_optimize()

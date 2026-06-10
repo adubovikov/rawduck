@@ -8,6 +8,8 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/parser/qualified_name.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
@@ -15,9 +17,14 @@ namespace duckdb {
 
 //===--------------------------------------------------------------------===//
 // Predicate statistics, RawMergeTree style: every optimized plan is scanned
-// for filters pushed down into base table scans, and the (table, column)
-// usage counts feed raw_optimize()'s ORDER BY selection.
+// for filters pushed into base table scans and for grouping columns, and the
+// (table, column) usage counts feed raw_optimize()'s ORDER BY selection.
 //===--------------------------------------------------------------------===//
+
+struct RawColumnUsage {
+	idx_t filters = 0;
+	idx_t groups = 0;
+};
 
 class RawStatsCache : public ObjectCacheEntry {
 public:
@@ -33,8 +40,8 @@ public:
 	}
 
 	mutex lock;
-	// fully qualified table key -> column name -> observed pushed-down filters
-	map<string, map<string, idx_t>> filter_counts;
+	// fully qualified table key -> column name -> observed usage
+	map<string, map<string, RawColumnUsage>> usage;
 };
 
 static RawStatsCache &GetStatsCache(ClientContext &context) {
@@ -46,7 +53,32 @@ static string TableKey(const TableCatalogEntry &table) {
 	       "." + StringUtil::Lower(table.name);
 }
 
-static void CollectFilterStats(ClientContext &context, LogicalOperator &op) {
+// Resolves a scan output column (binding into column_ids) back to its name.
+static bool ResolveGetColumn(const LogicalGet &get, idx_t column_index, string &name) {
+	auto &column_ids = get.GetColumnIds();
+	if (column_index >= column_ids.size()) {
+		return false;
+	}
+	auto table_column = column_ids[column_index].GetPrimaryIndex();
+	if (table_column >= get.names.size()) {
+		return false;
+	}
+	name = get.names[table_column];
+	return true;
+}
+
+static void CollectGets(LogicalOperator &op, unordered_map<idx_t, optional_ptr<LogicalGet>> &gets) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		gets[get.table_index] = &get;
+	}
+	for (auto &child : op.children) {
+		CollectGets(*child, gets);
+	}
+}
+
+static void CollectStats(ClientContext &context, LogicalOperator &op,
+                         const unordered_map<idx_t, optional_ptr<LogicalGet>> &gets) {
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op.Cast<LogicalGet>();
 		auto table = get.GetTable();
@@ -60,12 +92,34 @@ static void CollectFilterStats(ClientContext &context, LogicalOperator &op) {
 				if (filter.first >= get.names.size()) {
 					continue;
 				}
-				stats.filter_counts[key][get.names[filter.first]]++;
+				stats.usage[key][get.names[filter.first]].filters++;
 			}
+		}
+	} else if (op.type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		// grouping columns that reference a base table scan directly
+		auto &aggregate = op.Cast<LogicalAggregate>();
+		for (auto &group : aggregate.groups) {
+			if (group->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+				continue;
+			}
+			auto &column_ref = group->Cast<BoundColumnRefExpression>();
+			auto entry = gets.find(column_ref.binding.table_index);
+			if (entry == gets.end() || !entry->second) {
+				continue;
+			}
+			auto &get = *entry->second;
+			auto table = get.GetTable();
+			string column_name;
+			if (!table || !ResolveGetColumn(get, column_ref.binding.column_index, column_name)) {
+				continue;
+			}
+			auto &stats = GetStatsCache(context);
+			lock_guard<mutex> guard(stats.lock);
+			stats.usage[TableKey(*table)][column_name].groups++;
 		}
 	}
 	for (auto &child : op.children) {
-		CollectFilterStats(context, *child);
+		CollectStats(context, *child, gets);
 	}
 }
 
@@ -75,7 +129,9 @@ static void RawDuckOptimizeHook(OptimizerExtensionInput &input, unique_ptr<Logic
 	}
 	// observation must never break a query
 	try {
-		CollectFilterStats(input.context, *plan);
+		unordered_map<idx_t, optional_ptr<LogicalGet>> gets;
+		CollectGets(*plan, gets);
+		CollectStats(input.context, *plan, gets);
 	} catch (...) { // NOLINT: best-effort statistics collection
 	}
 }
@@ -91,14 +147,14 @@ OptimizerExtension GetRawDuckOptimizerExtension() {
 //===--------------------------------------------------------------------===//
 
 struct RawStatsState : public GlobalTableFunctionState {
-	vector<std::tuple<string, string, idx_t>> entries;
+	vector<std::tuple<string, string, idx_t, idx_t>> entries;
 	idx_t next = 0;
 };
 
 static unique_ptr<FunctionData> RawStatsBind(ClientContext &context, TableFunctionBindInput &input,
                                              vector<LogicalType> &return_types, vector<string> &names) {
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT};
-	names = {"table", "column", "filter_count"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT};
+	names = {"table", "column", "filter_count", "group_count"};
 	return make_uniq<TableFunctionData>();
 }
 
@@ -106,9 +162,9 @@ static unique_ptr<GlobalTableFunctionState> RawStatsInit(ClientContext &context,
 	auto state = make_uniq<RawStatsState>();
 	auto &stats = GetStatsCache(context);
 	lock_guard<mutex> guard(stats.lock);
-	for (auto &table : stats.filter_counts) {
+	for (auto &table : stats.usage) {
 		for (auto &column : table.second) {
-			state->entries.emplace_back(table.first, column.first, column.second);
+			state->entries.emplace_back(table.first, column.first, column.second.filters, column.second.groups);
 		}
 	}
 	return std::move(state);
@@ -122,6 +178,7 @@ static void RawStatsFunction(ClientContext &context, TableFunctionInput &data, D
 		output.SetValue(0, count, Value(std::get<0>(entry)));
 		output.SetValue(1, count, Value(std::get<1>(entry)));
 		output.SetValue(2, count, Value::BIGINT(NumericCast<int64_t>(std::get<2>(entry))));
+		output.SetValue(3, count, Value::BIGINT(NumericCast<int64_t>(std::get<3>(entry))));
 		count++;
 	}
 	output.SetCardinality(count);
@@ -179,9 +236,13 @@ static void RawOptimizeFunction(ClientContext &context, TableFunctionInput &data
 	{
 		auto &stats = GetStatsCache(context);
 		lock_guard<mutex> guard(stats.lock);
-		auto entry = stats.filter_counts.find(TableKey(table));
-		if (entry != stats.filter_counts.end()) {
-			ranked.assign(entry->second.begin(), entry->second.end());
+		auto entry = stats.usage.find(TableKey(table));
+		if (entry != stats.usage.end()) {
+			for (auto &column : entry->second) {
+				// filters benefit most from zone-map pruning; grouping
+				// locality is a secondary win
+				ranked.emplace_back(column.first, 2 * column.second.filters + column.second.groups);
+			}
 		}
 	}
 	std::stable_sort(ranked.begin(), ranked.end(),

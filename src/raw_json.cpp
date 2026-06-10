@@ -105,58 +105,92 @@ void RawPayload::Parse(const string &payload, const RawParseOptions &options) {
 	}
 }
 
-// Ingest-time transform: one output row per element of the array at `path`,
-// with the envelope's other top-level fields merged into each row. Rows
-// without the array pass through unchanged.
+// One envelope per traversed level: the object plus the key that was
+// descended into (excluded when merging).
+struct RawExplodeEnvelope {
+	yyjson_val *object;
+	const string *descended_key;
+};
+
+static void AddObjectFields(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjson::yyjson_mut_val *merged,
+                            yyjson_val *object, const string *skip_key) {
+	yyjson_obj_iter iter;
+	duckdb_yyjson::yyjson_obj_iter_init(object, &iter);
+	while (auto key = duckdb_yyjson::yyjson_obj_iter_next(&iter)) {
+		auto key_str = duckdb_yyjson::yyjson_get_str(key);
+		auto key_len = duckdb_yyjson::yyjson_get_len(key);
+		if (skip_key && skip_key->size() == key_len && memcmp(skip_key->data(), key_str, key_len) == 0) {
+			continue;
+		}
+		// first writer wins: deeper levels are added before shallower ones
+		if (duckdb_yyjson::yyjson_mut_obj_getn(merged, key_str, key_len)) {
+			continue;
+		}
+		auto key_copy = duckdb_yyjson::yyjson_mut_strncpy(doc, key_str, key_len);
+		duckdb_yyjson::yyjson_mut_obj_add(
+		    merged, key_copy, duckdb_yyjson::yyjson_val_mut_copy(doc, duckdb_yyjson::yyjson_obj_iter_get_val(key)));
+	}
+}
+
+static void EmitMergedRow(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjson::yyjson_mut_val *out_rows, yyjson_val *leaf,
+                          const vector<RawExplodeEnvelope> &envelopes) {
+	if (!duckdb_yyjson::yyjson_is_obj(leaf)) {
+		// scalar leaf elements cannot be merged: pass them through
+		duckdb_yyjson::yyjson_mut_arr_append(out_rows, duckdb_yyjson::yyjson_val_mut_copy(doc, leaf));
+		return;
+	}
+	auto merged = duckdb_yyjson::yyjson_mut_obj(doc);
+	AddObjectFields(doc, merged, leaf, nullptr);
+	// envelopes from deepest to shallowest: deeper fields win on collision
+	for (idx_t i = envelopes.size(); i > 0; i--) {
+		AddObjectFields(doc, merged, envelopes[i - 1].object, envelopes[i - 1].descended_key);
+	}
+	duckdb_yyjson::yyjson_mut_arr_append(out_rows, merged);
+}
+
+// Recursive multi-level explode: each path segment descends into an object
+// key; arrays along the way fan out into one row per element. This handles
+// both flat envelopes (cloudwatch-logs: logEvents) and nested ones
+// (otlp-traces: resourceSpans.scopeSpans.spans).
+static void ExplodeInto(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjson::yyjson_mut_val *out_rows, yyjson_val *node,
+                        const vector<string> &path, idx_t depth, vector<RawExplodeEnvelope> &envelopes) {
+	if (depth == path.size()) {
+		EmitMergedRow(doc, out_rows, node, envelopes);
+		return;
+	}
+	if (!duckdb_yyjson::yyjson_is_obj(node)) {
+		EmitMergedRow(doc, out_rows, node, envelopes);
+		return;
+	}
+	auto &segment = path[depth];
+	auto child = duckdb_yyjson::yyjson_obj_getn(node, segment.c_str(), segment.size());
+	if (!child) {
+		// the hop is absent: pass the row through unchanged (merged with any
+		// envelopes accumulated so far)
+		EmitMergedRow(doc, out_rows, node, envelopes);
+		return;
+	}
+	envelopes.push_back(RawExplodeEnvelope {node, &segment});
+	if (duckdb_yyjson::yyjson_is_arr(child)) {
+		duckdb_yyjson::yyjson_arr_iter elements;
+		duckdb_yyjson::yyjson_arr_iter_init(child, &elements);
+		while (auto element = duckdb_yyjson::yyjson_arr_iter_next(&elements)) {
+			ExplodeInto(doc, out_rows, element, path, depth + 1, envelopes);
+		}
+	} else {
+		ExplodeInto(doc, out_rows, child, path, depth + 1, envelopes);
+	}
+	envelopes.pop_back();
+}
+
 void RawPayload::Explode(const vector<string> &path) {
 	auto mut_doc = duckdb_yyjson::yyjson_mut_doc_new(nullptr);
 	auto out_rows = duckdb_yyjson::yyjson_mut_arr(mut_doc);
 	duckdb_yyjson::yyjson_mut_doc_set_root(mut_doc, out_rows);
 
+	vector<RawExplodeEnvelope> envelopes;
 	for (auto row : rows) {
-		auto arr = row;
-		for (auto &segment : path) {
-			arr = arr && duckdb_yyjson::yyjson_is_obj(arr)
-			          ? duckdb_yyjson::yyjson_obj_getn(arr, segment.c_str(), segment.size())
-			          : nullptr;
-		}
-		if (!arr || !duckdb_yyjson::yyjson_is_arr(arr)) {
-			duckdb_yyjson::yyjson_mut_arr_append(out_rows, duckdb_yyjson::yyjson_val_mut_copy(mut_doc, row));
-			continue;
-		}
-		duckdb_yyjson::yyjson_arr_iter elements;
-		duckdb_yyjson::yyjson_arr_iter_init(arr, &elements);
-		while (auto element = duckdb_yyjson::yyjson_arr_iter_next(&elements)) {
-			if (!duckdb_yyjson::yyjson_is_obj(element)) {
-				duckdb_yyjson::yyjson_mut_arr_append(out_rows, duckdb_yyjson::yyjson_val_mut_copy(mut_doc, element));
-				continue;
-			}
-			auto merged = duckdb_yyjson::yyjson_mut_obj(mut_doc);
-			// element fields first: they win over envelope fields on collision
-			yyjson_obj_iter iter;
-			duckdb_yyjson::yyjson_obj_iter_init(element, &iter);
-			while (auto key = duckdb_yyjson::yyjson_obj_iter_next(&iter)) {
-				auto key_copy = duckdb_yyjson::yyjson_mut_strncpy(mut_doc, duckdb_yyjson::yyjson_get_str(key),
-				                                                  duckdb_yyjson::yyjson_get_len(key));
-				duckdb_yyjson::yyjson_mut_obj_add(
-				    merged, key_copy,
-				    duckdb_yyjson::yyjson_val_mut_copy(mut_doc, duckdb_yyjson::yyjson_obj_iter_get_val(key)));
-			}
-			duckdb_yyjson::yyjson_obj_iter_init(row, &iter);
-			while (auto key = duckdb_yyjson::yyjson_obj_iter_next(&iter)) {
-				auto key_str = duckdb_yyjson::yyjson_get_str(key);
-				auto key_len = duckdb_yyjson::yyjson_get_len(key);
-				if (string(key_str, key_len) == path[0] ||
-				    duckdb_yyjson::yyjson_mut_obj_getn(merged, key_str, key_len)) {
-					continue;
-				}
-				auto key_copy = duckdb_yyjson::yyjson_mut_strncpy(mut_doc, key_str, key_len);
-				duckdb_yyjson::yyjson_mut_obj_add(
-				    merged, key_copy,
-				    duckdb_yyjson::yyjson_val_mut_copy(mut_doc, duckdb_yyjson::yyjson_obj_iter_get_val(key)));
-			}
-			duckdb_yyjson::yyjson_mut_arr_append(out_rows, merged);
-		}
+		ExplodeInto(mut_doc, out_rows, row, path, 0, envelopes);
 	}
 
 	auto exploded = duckdb_yyjson::yyjson_mut_doc_imut_copy(mut_doc, nullptr);
@@ -190,25 +224,30 @@ shared_ptr<RawParsedPayload> RawParsedPayload::Process(const string &payload_tex
 	return result;
 }
 
-RawParseOptions ResolveTransform(const string &transform, const string &explode) {
-	if (!transform.empty() && !explode.empty()) {
-		throw InvalidInputException("RawDuck: specify either transform or explode, not both");
-	}
-	string path = explode;
-	if (!transform.empty()) {
-		auto name = StringUtil::Lower(transform);
-		if (name == "cloudwatch-logs") {
-			path = "logEvents";
-		} else if (name == "cloudtrail") {
-			path = "Records";
-		} else if (name == "firehose") {
-			path = "records";
-		} else {
-			throw InvalidInputException("RawDuck: unknown transform '%s' (supported: cloudwatch-logs, cloudtrail, "
-			                            "firehose; or use explode := 'dotted.path')",
-			                            transform);
+const vector<pair<string, string>> &RawBuiltinTransforms() {
+	static const vector<pair<string, string>> builtins = {
+	    {"cloudwatch-logs", "logEvents"},
+	    {"cloudtrail", "Records"},
+	    {"firehose", "records"},
+	    {"otlp-traces", "resourceSpans.scopeSpans.spans"},
+	    {"otlp-logs", "resourceLogs.scopeLogs.logRecords"},
+	    {"otlp-metrics", "resourceMetrics.scopeMetrics.metrics"},
+	};
+	return builtins;
+}
+
+bool ResolveBuiltinTransform(const string &name, string &path) {
+	auto lower = StringUtil::Lower(name);
+	for (auto &builtin : RawBuiltinTransforms()) {
+		if (builtin.first == lower) {
+			path = builtin.second;
+			return true;
 		}
 	}
+	return false;
+}
+
+RawParseOptions RawExplodeOptions(const string &path) {
 	RawParseOptions options;
 	if (!path.empty()) {
 		options.explode_path = StringUtil::Split(path, '.');

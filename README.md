@@ -58,15 +58,15 @@ Same machine (Apple Silicon, DuckDB v1.5.3), best of 3:
 
 | | JSON column | RawDuck |
 |---|---:|---:|
-| ingest (full hour, 956 MB) | 1.4 s | **11.3 s** |
+| ingest (full hour, 956 MB) | 1.4 s | **9.8 s** |
 | storage on disk | 1.05 GB | **627 MB** |
 
-Ingest runs at ~22,000 events/s (~85 MB/s) — a one-time cost within an order of magnitude of
+Ingest runs at ~25,000 events/s (~98 MB/s), with parsing pipelined on a background thread — a one-time cost within an order of magnitude of
 loading opaque JSON strings, in exchange for every later query being 45–265× faster and the data
 40% smaller on disk.
 
 ```sql
-SELECT * FROM raw_ingest_file('gh_events', '/data/2024-01-15-10.json.gz');   -- 11.3s, 914 columns
+SELECT * FROM raw_ingest_file('gh_events', '/data/2024-01-15-10.json.gz');   -- 9.8s, 914 columns
 
 SELECT type, count(*) FROM gh_events GROUP BY type ORDER BY 2 DESC;          -- 1 ms
 SELECT "repo.name", count(*) AS pushes FROM gh_events
@@ -80,8 +80,9 @@ WHERE type = 'PushEvent' GROUP BY 1 ORDER BY pushes DESC LIMIT 10;           -- 
 | `raw_ingest(table, payload)` | table | Schema-less ingest: auto-creates the table, adds new columns, widens conflicting types, appends — natively, inside your transaction. Accepts a JSON array, a single object, scalars, or NDJSON. Returns `(table, created, columns_added, columns_widened, rows, errors)`. |
 | `raw_ingest_file(table, path, batch_size := 30000)` | table | Streaming ingest of NDJSON files (gzip auto-detected, any DuckDB filesystem) in bounded-memory batches, evolving the schema between batches. The whole file is one atomic operation. |
 | `raw_records(payload)` | table | Parse + infer + flatten a JSON payload into typed rows without touching any table. |
-| `raw_stats()` | table | Observed predicate statistics: which columns queries actually filter on, collected automatically from pushed-down filters. |
-| `raw_optimize(table)` | table | RawMergeTree-style adaptive layout: physically reorders the table by its most-filtered columns (from `raw_stats`). |
+| `raw_stats()` | table | Observed usage statistics per column: pushed-down filters and GROUP BY keys, collected automatically by an optimizer hook. |
+| `raw_optimize(table)` | table | RawMergeTree-style adaptive layout: physically reorders the table by its hottest columns (filters weighted over groupings, from `raw_stats`). |
+| `raw_transforms()` / `raw_transform_define(name, path)` | table / scalar | List and register ingest-time transforms; definitions compose with `read_json`, tables, or any query. |
 | `raw_type(json)` | scalar | Concrete type of a JSON value (RawTree's `dynamicType()`): `Null`, `Bool`, `Int64`, `UInt64`, `Double`, `String`, `Array`, `Object`. |
 | `raw_infer(json)` | scalar | The DuckDB type RawDuck assigns to a value, e.g. `BIGINT`, `DOUBLE[]`, or the flattened layout for objects: `OBJECT(a BIGINT, b.c VARCHAR)`. |
 
@@ -117,8 +118,19 @@ SELECT * FROM raw_ingest('logs', payload, transform := 'cloudwatch-logs');
 SELECT * FROM raw_ingest('events', payload, explode := 'batch.items');
 ```
 
-Built-in transform names: `cloudwatch-logs`, `cloudtrail`, `firehose`. Dirty NDJSON streams can be
-ingested with `ignore_errors := true`; skipped lines are counted in the `errors` column.
+Built-in transforms: `cloudwatch-logs`, `cloudtrail`, `firehose`, `otlp-traces`, `otlp-logs`,
+`otlp-metrics` (multi-level envelopes like `resourceSpans[].scopeSpans[].spans[]` are unwrapped
+with resource/scope fields merged into every row). Transforms are user-extensible — definitions
+are data, so they load from files or tables like anything else in DuckDB:
+
+```sql
+SELECT raw_transform_define('my-batch', 'data.items');                          -- one-off
+SELECT raw_transform_define(name, explode) FROM read_json('transforms.json');   -- from a file
+SELECT raw_transform_define(name, explode) FROM raw.transform_config;           -- from a table
+SELECT * FROM raw_transforms();                                                 -- list them all
+```
+
+Dirty NDJSON streams can be ingested with `ignore_errors := true`; skipped lines are counted in the `errors` column.
 
 ## The type lattice
 
@@ -197,8 +209,7 @@ predicate statistics + adaptive reordering, and DuckLake catalogs (`test/sql/duc
 
 ## Roadmap
 
-- parallel payload parsing and multi-threaded appends
-- OTLP transforms (`otlp-traces`, `otlp-logs`, `otlp-metrics`)
+- multi-threaded appends (parsing is already pipelined off-thread)
 - auto-projections for repeated low-cardinality aggregations
 - incremental `raw_optimize` (reorder only new row groups, RawMergeTree merge-style)
 - persisted predicate statistics inside RawDuck stores

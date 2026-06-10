@@ -79,11 +79,11 @@ SELECT count(*) FROM t_opt WHERE k = 'b';
 statement ok
 SELECT count(*) FROM t_opt WHERE v > 1;
 
-query III
-SELECT "table", "column", filter_count >= 1 FROM raw_stats() WHERE "table" = 'memory.main.t_opt' ORDER BY "column";
+query IIII
+SELECT "table", "column", filter_count >= 1, group_count FROM raw_stats() WHERE "table" = 'memory.main.t_opt' ORDER BY "column";
 ----
-memory.main.t_opt	k	true
-memory.main.t_opt	v	true
+memory.main.t_opt	k	true	0
+memory.main.t_opt	v	true	0
 
 # physically reorder by the hottest predicate columns
 query III
@@ -184,3 +184,32 @@ statement error
 SELECT * FROM raw_ingest('t_dirty2', e'{"a":1}\n{not json}');
 ----
 <REGEX>:.*parse error on line 2.*
+
+# multi-level explode: OTLP traces
+query II
+SELECT name, "resource.service" FROM raw_records('{"resourceSpans":[{"resource":{"service":"api"},"scopeSpans":[{"spans":[{"name":"s1"},{"name":"s2"}]}]}]}', transform := 'otlp-traces') ORDER BY name;
+----
+s1	api
+s2	api
+
+# user-defined transforms compose with any source
+query I
+SELECT raw_transform_define('my-batch', 'data.items');
+----
+my-batch
+
+query II
+SELECT id, src FROM raw_records('{"src":"q","data":{"items":[{"id":1}]}}', transform := 'my-batch');
+----
+1	q
+
+query II
+SELECT name, builtin FROM raw_transforms() WHERE name IN ('otlp-traces', 'my-batch') ORDER BY name;
+----
+my-batch	false
+otlp-traces	true
+
+statement error
+SELECT raw_transform_define('cloudwatch-logs', 'x');
+----
+<REGEX>:.*built-in transform.*

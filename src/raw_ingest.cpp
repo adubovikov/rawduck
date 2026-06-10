@@ -24,6 +24,10 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
+#include <condition_variable>
+#include <deque>
+#include <thread>
+
 namespace duckdb {
 
 //===--------------------------------------------------------------------===//
@@ -172,12 +176,20 @@ public:
 
 	void Ingest(const string &payload_str) {
 		auto parsed = RawParsedPayload::Process(payload_str, options);
-		errors += parsed->payload.parse_errors;
+		IngestParsed(*parsed, payload_str);
+	}
+
+	void IngestParsed(RawParsedPayload &parsed, const string &payload_str) {
+		errors += parsed.payload.parse_errors;
 		if (native) {
-			IngestNative(*parsed);
+			IngestNative(parsed);
 		} else {
-			IngestFallback(*parsed, payload_str);
+			IngestFallback(parsed, payload_str);
 		}
+	}
+
+	const RawParseOptions &Options() const {
+		return options;
 	}
 
 	bool created = false;
@@ -520,7 +532,7 @@ static unique_ptr<FunctionData> RawIngestBind(ClientContext &context, TableFunct
 	}
 	result->target = input.inputs[0].GetValue<string>();
 	result->payload = input.inputs[1].GetValue<string>();
-	result->options = RawBindParseOptions(input.named_parameters);
+	result->options = RawBindParseOptions(context, input.named_parameters);
 	SetIngestSchema(return_types, names);
 	return std::move(result);
 }
@@ -575,7 +587,7 @@ static unique_ptr<FunctionData> RawIngestFileBind(ClientContext &context, TableF
 	}
 	result->target = input.inputs[0].GetValue<string>();
 	result->path = input.inputs[1].GetValue<string>();
-	result->options = RawBindParseOptions(input.named_parameters);
+	result->options = RawBindParseOptions(context, input.named_parameters);
 	result->batch_size = RAW_DEFAULT_BATCH_SIZE;
 	auto batch_entry = input.named_parameters.find("batch_size");
 	if (batch_entry != input.named_parameters.end() && !batch_entry->second.IsNull()) {
@@ -591,6 +603,57 @@ static unique_ptr<FunctionData> RawIngestFileBind(ClientContext &context, TableF
 	return std::move(result);
 }
 
+// Bounded handoff between the parse thread and the appending thread: parsing
+// and inference are pure and overlap with catalog/storage work.
+struct RawIngestPipeline {
+	struct Item {
+		shared_ptr<RawParsedPayload> parsed;
+		string payload;
+	};
+	static constexpr idx_t CAPACITY = 2;
+
+	mutex lock;
+	std::condition_variable producer_cv;
+	std::condition_variable consumer_cv;
+	std::deque<Item> queue;
+	bool finished = false;
+	bool aborted = false;
+	std::exception_ptr error;
+
+	void Push(Item item) {
+		std::unique_lock<mutex> guard(lock);
+		producer_cv.wait(guard, [&] { return queue.size() < CAPACITY || aborted; });
+		if (aborted) {
+			return;
+		}
+		queue.push_back(std::move(item));
+		consumer_cv.notify_one();
+	}
+	bool Pop(Item &item) {
+		std::unique_lock<mutex> guard(lock);
+		consumer_cv.wait(guard, [&] { return !queue.empty() || finished; });
+		if (queue.empty()) {
+			return false;
+		}
+		item = std::move(queue.front());
+		queue.pop_front();
+		producer_cv.notify_one();
+		return true;
+	}
+	void Finish(std::exception_ptr producer_error) {
+		std::unique_lock<mutex> guard(lock);
+		error = producer_error;
+		finished = true;
+		consumer_cv.notify_one();
+	}
+	void Abort() {
+		std::unique_lock<mutex> guard(lock);
+		aborted = true;
+		finished = true;
+		producer_cv.notify_one();
+	}
+};
+
 static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<RawIngestBindData>();
 	auto &state = data.global_state->Cast<RawIngestState>();
@@ -605,42 +668,70 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 	                                              FileOpenFlags(FileCompressionType::AUTO_DETECT));
 
 	RawIngestor ingestor(context, bind_data.target, bind_data.options);
+	RawIngestPipeline pipeline;
+	auto options = bind_data.options;
+	auto batch_size = bind_data.batch_size;
+
+	// the parse thread owns the file handle; only parsing and inference run
+	// here, never anything that touches the ClientContext
+	std::thread parser([&pipeline, &handle, options, batch_size] {
+		std::exception_ptr producer_error;
+		try {
+			auto buffer = make_unsafe_uniq_array_uninitialized<char>(RAW_READ_BUFFER_SIZE);
+			string pending;
+			idx_t pending_lines = 0;
+			auto process = [&](string batch) {
+				if (batch.find_first_not_of(" \t\r\n") == string::npos) {
+					return;
+				}
+				auto parsed = RawParsedPayload::Process(batch, options);
+				pipeline.Push(RawIngestPipeline::Item {std::move(parsed), std::move(batch)});
+			};
+			while (true) {
+				auto read = handle->Read(buffer.get(), RAW_READ_BUFFER_SIZE);
+				if (read <= 0) {
+					break;
+				}
+				for (int64_t i = 0; i < read; i++) {
+					if (buffer[i] == '\n') {
+						pending_lines++;
+					}
+				}
+				pending.append(buffer.get(), NumericCast<idx_t>(read));
+				while (pending_lines >= batch_size) {
+					// split off the first batch_size lines
+					idx_t split = 0;
+					for (idx_t line = 0; line < batch_size; line++) {
+						split = pending.find('\n', split) + 1;
+					}
+					process(pending.substr(0, split));
+					pending.erase(0, split);
+					pending_lines -= batch_size;
+				}
+			}
+			process(std::move(pending));
+		} catch (...) {
+			producer_error = std::current_exception();
+		}
+		pipeline.Finish(producer_error);
+	});
+
 	idx_t batches = 0;
-	auto buffer = make_unsafe_uniq_array_uninitialized<char>(RAW_READ_BUFFER_SIZE);
-	string pending;
-	idx_t pending_lines = 0;
-
-	auto flush = [&](string batch) {
-		if (batch.find_first_not_of(" \t\r\n") == string::npos) {
-			return;
+	try {
+		RawIngestPipeline::Item item;
+		while (pipeline.Pop(item)) {
+			ingestor.IngestParsed(*item.parsed, item.payload);
+			batches++;
 		}
-		ingestor.Ingest(batch);
-		batches++;
-	};
-
-	while (true) {
-		auto read = handle->Read(buffer.get(), RAW_READ_BUFFER_SIZE);
-		if (read <= 0) {
-			break;
-		}
-		for (int64_t i = 0; i < read; i++) {
-			if (buffer[i] == '\n') {
-				pending_lines++;
-			}
-		}
-		pending.append(buffer.get(), NumericCast<idx_t>(read));
-		while (pending_lines >= bind_data.batch_size) {
-			// split off the first batch_size lines
-			idx_t split = 0;
-			for (idx_t line = 0; line < bind_data.batch_size; line++) {
-				split = pending.find('\n', split) + 1;
-			}
-			flush(pending.substr(0, split));
-			pending.erase(0, split);
-			pending_lines -= bind_data.batch_size;
-		}
+	} catch (...) {
+		pipeline.Abort();
+		parser.join();
+		throw;
 	}
-	flush(std::move(pending));
+	parser.join();
+	if (pipeline.error) {
+		std::rethrow_exception(pipeline.error);
+	}
 
 	EmitIngestRow(output, bind_data.target, ingestor);
 	output.SetValue(6, 0, Value::BIGINT(NumericCast<int64_t>(batches)));
