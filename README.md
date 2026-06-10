@@ -83,6 +83,7 @@ WHERE type = 'PushEvent' GROUP BY 1 ORDER BY pushes DESC LIMIT 10;           -- 
 | `raw_stats()` | table | Observed usage statistics per column: pushed-down filters and GROUP BY keys, collected automatically by an optimizer hook. |
 | `raw_optimize(table)` | table | RawMergeTree-style adaptive layout: physically reorders the table by its hottest columns. Incremental: append-only growth since the last optimize sorts only the new tail into a fresh sorted run (`mode` = `full` / `incremental` / `noop`). |
 | `raw_transforms()` / `raw_transform_define(name, path)` | table / scalar | List and register ingest-time transforms; definitions compose with `read_json`, tables, or any query. |
+| `raw_stats_save(catalog?)` / `raw_stats_load(catalog?)` | table | Persist observed statistics into a store (`__rawduck_stats` table) and merge them back after restart. |
 | `raw_projections()` | table | The projection advisor: GROUP BY shapes queries actually run, with observation counts and materialization status. |
 | `raw_project(table)` | table | RawMergeTree auto-projections: materializes the hottest observed aggregation as a lightweight `<table>__proj` summary table. |
 | `raw_type(json)` | scalar | Concrete type of a JSON value (RawTree's `dynamicType()`): `Null`, `Bool`, `Int64`, `UInt64`, `Double`, `String`, `Array`, `Object`. |
@@ -173,7 +174,17 @@ SELECT * FROM raw_optimize('gh_events');
 SELECT type, count(*) FROM gh_events GROUP BY type;        -- observed by the advisor
 SELECT * FROM raw_project('gh_events');
 -- gh_events | gh_events__proj | type | 15                 -- pre-aggregated summary table
+
+SET rawduck_use_projections = true;
+SELECT type, count(*) FROM gh_events GROUP BY type;        -- now answered from the projection
 ```
+
+With `rawduck_use_projections` enabled (off by default), eligible `count(*)` aggregations are
+rewritten onto fresh projections transparently — result types and values are identical, and a
+physical-row-count staleness token guarantees a changed base table always falls back to a full
+scan. Intended for append-only analytics; in-place `UPDATE`s of group columns require re-running
+`raw_project`. Statistics persist across sessions with `raw_stats_save('store')` /
+`raw_stats_load('store')`.
 
 ## DuckLake as a backend
 
@@ -215,10 +226,12 @@ widening, schema evolution, structural conflicts, streaming file ingestion, mult
 error-tolerant ingestion, RawDuck stores (`ATTACH 'rawduck:...'`), transactional rollback,
 predicate statistics + adaptive reordering, and DuckLake catalogs (`test/sql/ducklake.test`).
 
-## Roadmap
+## Status
 
-- persisted statistics and projection registry inside RawDuck stores
-- automatic aggregate rewriting onto materialized projections
+All RawMergeTree concepts from the RawTree design are implemented: schema-less evolving ingestion
+(native, transactional, pipelined, multi-threaded), adaptive physical layout from observed
+predicates with incremental re-sorting, the projection advisor with automatic aggregate rewriting,
+extensible ingest-time transforms, persisted statistics, RawDuck stores, and DuckLake fallback.
 
 ---
 

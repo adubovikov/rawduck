@@ -89,3 +89,31 @@ query I
 SELECT name FROM raw2.events WHERE id = 2;
 ----
 c
+
+#===----------------------------------------------------------------------===#
+# persisted statistics inside stores
+#===----------------------------------------------------------------------===#
+
+statement ok
+SELECT count(*) FROM raw2.events WHERE id = 1;
+
+query I
+SELECT entries >= 1 FROM raw_stats_save('raw2');
+----
+true
+
+query I
+SELECT count(*) >= 1 FROM raw2.main.__rawduck_stats WHERE kind = 'column';
+----
+true
+
+# stats survive in the store and merge back into the live cache
+query I
+SELECT entries >= 1 FROM raw_stats_load('raw2');
+----
+true
+
+query I
+SELECT filter_count >= 2 FROM raw_stats() WHERE "table" = 'raw2.main.events' AND "column" = 'id';
+----
+true

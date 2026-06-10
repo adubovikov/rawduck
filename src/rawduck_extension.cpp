@@ -21,11 +21,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(GetRawTransformsFunction());
 	loader.RegisterFunction(GetRawProjectionsFunction());
 	loader.RegisterFunction(GetRawProjectFunction());
+	loader.RegisterFunction(GetRawStatsSaveFunction());
+	loader.RegisterFunction(GetRawStatsLoadFunction());
 	loader.RegisterFunction(GetRawTransformDefineFunction());
 
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	// observe pushed-down predicates to drive raw_optimize()
 	OptimizerExtension::Register(config, GetRawDuckOptimizerExtension());
+	config.AddExtensionOption("rawduck_use_projections",
+	                          "Rewrite eligible count(*) aggregations onto fresh materialized projections "
+	                          "(append-only workloads)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	// ATTACH 'rawduck:store.db' AS raw
 	StorageExtension::Register(config, "rawduck", GetRawDuckStorageExtension());
 }

@@ -17,6 +17,8 @@ TableFunction GetRawOptimizeFunction();
 TableFunction GetRawTransformsFunction();
 TableFunction GetRawProjectionsFunction();
 TableFunction GetRawProjectFunction();
+TableFunctionSet GetRawStatsSaveFunction();
+TableFunctionSet GetRawStatsLoadFunction();
 ScalarFunction GetRawTypeFunction();
 ScalarFunction GetRawInferFunction();
 ScalarFunction GetRawTransformDefineFunction();

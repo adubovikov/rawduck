@@ -311,3 +311,56 @@ query II
 SELECT count(*), min(v) FROM t_opt WHERE k = 'a';
 ----
 3	0
+
+#===----------------------------------------------------------------------===#
+# automatic aggregate rewriting onto fresh projections
+#===----------------------------------------------------------------------===#
+
+statement ok
+SELECT * FROM raw_project('t_proj');
+
+statement ok
+SET rawduck_use_projections = true;
+
+# correct results through the projection
+query II
+SELECT k, count(*) FROM t_proj GROUP BY k ORDER BY k;
+----
+a	2
+b	1
+
+# prove the projection is being scanned: temper with it and observe
+statement ok
+UPDATE t_proj__proj SET count = 100 WHERE k = 'a';
+
+query II
+SELECT k, count(*) FROM t_proj GROUP BY k ORDER BY k;
+----
+a	100
+b	1
+
+# any base-table change invalidates the projection: falls back to the base
+statement ok
+SELECT * FROM raw_ingest('t_proj', '[{"k":"b","g":3}]');
+
+query II
+SELECT k, count(*) FROM t_proj GROUP BY k ORDER BY k;
+----
+a	2
+b	2
+
+# filtered or non-count aggregations are never rewritten
+query II
+SELECT k, count(*) FROM t_proj WHERE g > 0 GROUP BY k ORDER BY k;
+----
+a	2
+b	2
+
+statement ok
+SET rawduck_use_projections = false;
+
+query II
+SELECT k, count(*) FROM t_proj GROUP BY k ORDER BY k;
+----
+a	2
+b	2

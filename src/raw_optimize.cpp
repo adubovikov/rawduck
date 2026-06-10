@@ -2,10 +2,16 @@
 #include "raw_json.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/function/function_binder.hpp"
+#include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/parser/qualified_name.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -46,8 +52,16 @@ public:
 	map<string, map<string, RawColumnUsage>> usage;
 	// fully qualified table key -> sorted group-by column set -> times observed
 	map<string, map<string, idx_t>> group_sets;
-	// fully qualified table key -> materialized projection table name
-	map<string, pair<string, string>> projections;
+	struct Projection {
+		string catalog;
+		string schema;
+		string name;
+		string group_set;
+		// staleness token: the base table's physical row count at materialization
+		idx_t base_rows = 0;
+	};
+	// fully qualified table key -> materialized projection
+	map<string, Projection> projections;
 
 	struct OptimizeState {
 		string order_by;
@@ -178,6 +192,186 @@ static void CollectStats(ClientContext &context, LogicalOperator &op,
 	}
 }
 
+//===--------------------------------------------------------------------===//
+// Automatic aggregate rewriting onto materialized projections
+//
+// Runs pre-optimization (clean bound plans): PROJECTION -> AGGREGATE
+// (count(*)) -> GET(base table) becomes an aggregation over the projection
+// table with CAST(sum(count) AS BIGINT), so result types are unchanged.
+// Guarded by the rawduck_use_projections setting and a physical-row-count
+// staleness token; any mismatch falls back to the base table.
+//===--------------------------------------------------------------------===//
+
+static bool TryRewriteToProjection(ClientContext &context, LogicalOperator &parent) {
+	if (parent.type != LogicalOperatorType::LOGICAL_PROJECTION || parent.children.size() != 1) {
+		return false;
+	}
+	auto &child = *parent.children[0];
+	if (child.type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY || child.children.size() != 1) {
+		return false;
+	}
+	auto &aggregate = child.Cast<LogicalAggregate>();
+	auto &grandchild = *child.children[0];
+	if (grandchild.type != LogicalOperatorType::LOGICAL_GET) {
+		return false;
+	}
+	auto &get = grandchild.Cast<LogicalGet>();
+	auto table = get.GetTable();
+	if (!table || !get.table_filters.filters.empty()) {
+		return false;
+	}
+	// exactly one ungrouped-set count(*) aggregate
+	if (!aggregate.grouping_functions.empty() || aggregate.grouping_sets.size() > 1 ||
+	    aggregate.expressions.size() != 1 || aggregate.groups.empty()) {
+		return false;
+	}
+	if (aggregate.expressions[0]->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+		return false;
+	}
+	auto &count_aggregate = aggregate.expressions[0]->Cast<BoundAggregateExpression>();
+	if (count_aggregate.function.name != "count_star" || !count_aggregate.children.empty() ||
+	    count_aggregate.IsDistinct()) {
+		return false;
+	}
+	// all groups are plain scanned columns
+	vector<string> group_names;
+	for (auto &group : aggregate.groups) {
+		if (group->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+			return false;
+		}
+		auto &column_ref = group->Cast<BoundColumnRefExpression>();
+		string name;
+		if (column_ref.binding.table_index != get.table_index ||
+		    !ResolveGetColumn(get, column_ref.binding.column_index, name)) {
+			return false;
+		}
+		group_names.push_back(name);
+	}
+	auto sorted_names = group_names;
+	std::sort(sorted_names.begin(), sorted_names.end());
+
+	// a fresh projection for exactly this group set must be registered
+	RawStatsCache::Projection projection;
+	{
+		auto &stats = GetStatsCache(context);
+		lock_guard<mutex> guard(stats.lock);
+		auto entry = stats.projections.find(TableKey(*table));
+		if (entry == stats.projections.end() || entry->second.group_set != StringUtil::Join(sorted_names, ", ")) {
+			return false;
+		}
+		projection = entry->second;
+	}
+	if (table->GetStorage().GetTotalRows() != projection.base_rows) {
+		// the base table changed since materialization: never use stale data
+		return false;
+	}
+	auto projection_table = Catalog::GetEntry<TableCatalogEntry>(context, projection.catalog, projection.schema,
+	                                                             projection.name, OnEntryNotFound::RETURN_NULL);
+	if (!projection_table) {
+		return false;
+	}
+	// the parent projection must reference aggregate outputs as plain columns
+	for (auto &expression : parent.expressions) {
+		if (expression->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+			return false;
+		}
+	}
+	// map group columns and the count column into the projection table
+	case_insensitive_map_t<idx_t> projection_columns;
+	idx_t physical_index = 0;
+	for (auto &column : projection_table->GetColumns().Physical()) {
+		projection_columns[column.Name()] = physical_index++;
+	}
+	vector<ColumnIndex> new_column_ids;
+	for (auto &name : group_names) {
+		auto entry = projection_columns.find(name);
+		if (entry == projection_columns.end()) {
+			return false;
+		}
+		new_column_ids.emplace_back(entry->second);
+	}
+	auto count_entry = projection_columns.find("count");
+	if (count_entry == projection_columns.end()) {
+		return false;
+	}
+	new_column_ids.emplace_back(count_entry->second);
+
+	// build the replacement scan over the projection table
+	unique_ptr<FunctionData> bind_data;
+	auto scan_function = projection_table->GetScanFunction(context, bind_data);
+	vector<LogicalType> scan_types;
+	vector<string> scan_names;
+	for (auto &column : projection_table->GetColumns().Physical()) {
+		scan_types.push_back(column.Type());
+		scan_names.push_back(column.Name());
+	}
+	auto new_get = make_uniq<LogicalGet>(get.table_index, scan_function, std::move(bind_data), std::move(scan_types),
+	                                     std::move(scan_names));
+	new_get->GetMutableColumnIds() = std::move(new_column_ids);
+
+	// retarget the groups and turn count(*) into CAST(sum(count) AS BIGINT)
+	for (idx_t i = 0; i < aggregate.groups.size(); i++) {
+		aggregate.groups[i]->Cast<BoundColumnRefExpression>().binding = ColumnBinding(get.table_index, i);
+	}
+	auto &sum_entry = Catalog::GetEntry<AggregateFunctionCatalogEntry>(context, INVALID_CATALOG, DEFAULT_SCHEMA, "sum");
+	FunctionBinder function_binder(context);
+	vector<LogicalType> sum_arguments {LogicalType::BIGINT};
+	ErrorData bind_error;
+	auto sum_offset = function_binder.BindFunction(sum_entry.name, sum_entry.functions, sum_arguments, bind_error);
+	if (!sum_offset.IsValid()) {
+		return false;
+	}
+	auto sum_function = sum_entry.functions.GetFunctionByOffset(sum_offset.GetIndex());
+	vector<unique_ptr<Expression>> sum_children;
+	sum_children.push_back(
+	    make_uniq<BoundColumnRefExpression>(LogicalType::BIGINT, ColumnBinding(get.table_index, group_names.size())));
+	auto bound_sum = function_binder.BindAggregateFunction(sum_function, std::move(sum_children), nullptr,
+	                                                       AggregateType::NON_DISTINCT);
+	auto sum_type = bound_sum->return_type;
+	auto count_binding = ColumnBinding(aggregate.aggregate_index, 0);
+	aggregate.expressions[0] = std::move(bound_sum);
+	child.children[0] = std::move(new_get);
+
+	// the parent keeps producing BIGINT for the count column
+	for (auto &expression : parent.expressions) {
+		auto &column_ref = expression->Cast<BoundColumnRefExpression>();
+		if (column_ref.binding == count_binding) {
+			auto original_type = column_ref.return_type;
+			column_ref.return_type = sum_type;
+			expression = BoundCastExpression::AddCastToType(context, std::move(expression), original_type);
+		}
+	}
+	child.children[0]->ResolveOperatorTypes();
+	child.ResolveOperatorTypes();
+	return true;
+}
+
+static void RewriteAggregates(ClientContext &context, LogicalOperator &op) {
+	TryRewriteToProjection(context, op);
+	for (auto &child : op.children) {
+		RewriteAggregates(context, *child);
+	}
+}
+
+static void RawDuckPreOptimizeHook(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	if (!plan) {
+		return;
+	}
+	Value enabled;
+	if (!input.context.TryGetCurrentSetting("rawduck_use_projections", enabled) || !enabled.GetValue<bool>()) {
+		return;
+	}
+	{
+		// fast bail-out when nothing is materialized
+		auto &stats = GetStatsCache(input.context);
+		lock_guard<mutex> guard(stats.lock);
+		if (stats.projections.empty()) {
+			return;
+		}
+	}
+	RewriteAggregates(input.context, *plan);
+}
+
 static void RawDuckOptimizeHook(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
 	if (!plan) {
 		return;
@@ -194,6 +388,7 @@ static void RawDuckOptimizeHook(OptimizerExtensionInput &input, unique_ptr<Logic
 OptimizerExtension GetRawDuckOptimizerExtension() {
 	OptimizerExtension extension;
 	extension.optimize_function = RawDuckOptimizeHook;
+	extension.pre_optimize_function = RawDuckPreOptimizeHook;
 	return extension;
 }
 
@@ -430,8 +625,8 @@ static unique_ptr<GlobalTableFunctionState> RawProjectionsInit(ClientContext &co
 		auto materialized = stats.projections.find(table.first);
 		for (auto &group_set : table.second) {
 			string projection;
-			if (materialized != stats.projections.end() && materialized->second.second == group_set.first) {
-				projection = materialized->second.first;
+			if (materialized != stats.projections.end() && materialized->second.group_set == group_set.first) {
+				projection = materialized->second.name;
 			}
 			state->entries.emplace_back(table.first, group_set.first, group_set.second, projection);
 		}
@@ -536,7 +731,13 @@ static void RawProjectFunction(ClientContext &context, TableFunctionInput &data,
 	{
 		auto &stats = GetStatsCache(context);
 		lock_guard<mutex> guard(stats.lock);
-		stats.projections[TableKey(table)] = {projection_name, group_set};
+		RawStatsCache::Projection registered;
+		registered.catalog = table.ParentCatalog().GetName();
+		registered.schema = table.ParentSchema().name;
+		registered.name = projection_name;
+		registered.group_set = group_set;
+		registered.base_rows = table.GetStorage().GetTotalRows();
+		stats.projections[TableKey(table)] = registered;
 	}
 	output.SetValue(1, 0, Value(projection_name));
 	output.SetValue(2, 0, Value(group_set));
@@ -546,6 +747,136 @@ static void RawProjectFunction(ClientContext &context, TableFunctionInput &data,
 
 TableFunction GetRawProjectFunction() {
 	return TableFunction("raw_project", {LogicalType::VARCHAR}, RawProjectFunction, RawProjectBind, RawOptimizeInit);
+}
+
+//===--------------------------------------------------------------------===//
+// raw_stats_save / raw_stats_load: persist observed statistics in a store
+//===--------------------------------------------------------------------===//
+
+struct RawStatsIOBindData : public TableFunctionData {
+	string catalog;
+};
+
+static unique_ptr<FunctionData> RawStatsIOBind(ClientContext &context, TableFunctionBindInput &input,
+                                               vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<RawStatsIOBindData>();
+	if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
+		result->catalog = input.inputs[0].GetValue<string>();
+	}
+	return_types = {LogicalType::VARCHAR, LogicalType::BIGINT};
+	names = {"catalog", "entries"};
+	return std::move(result);
+}
+
+static string StatsTable(ClientContext &context, const string &catalog) {
+	auto name = catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : catalog;
+	return RawQuoteIdentifier(name) + ".main.__rawduck_stats";
+}
+
+static string SQLString(const string &value) {
+	return KeywordHelper::WriteQuoted(value, '\'');
+}
+
+static void RawStatsSaveFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &bind_data = data.bind_data->Cast<RawStatsIOBindData>();
+	auto &state = data.global_state->Cast<RawOptimizeState>();
+	if (state.done) {
+		output.SetCardinality(0);
+		return;
+	}
+	state.done = true;
+
+	// snapshot the in-memory statistics
+	vector<string> rows;
+	{
+		auto &stats = GetStatsCache(context);
+		lock_guard<mutex> guard(stats.lock);
+		for (auto &table : stats.usage) {
+			for (auto &column : table.second) {
+				rows.push_back("('column', " + SQLString(table.first) + ", " + SQLString(column.first) + ", " +
+				               to_string(column.second.filters) + ", " + to_string(column.second.groups) + ")");
+			}
+		}
+		for (auto &table : stats.group_sets) {
+			for (auto &group_set : table.second) {
+				rows.push_back("('group_set', " + SQLString(table.first) + ", " + SQLString(group_set.first) + ", " +
+				               to_string(group_set.second) + ", 0)");
+			}
+		}
+	}
+	auto stats_table = StatsTable(context, bind_data.catalog);
+	Connection conn(*context.db);
+	auto run = [&](const string &sql) {
+		auto result = conn.Query(sql);
+		if (result->HasError()) {
+			result->ThrowError("RawDuck: ");
+		}
+	};
+	run("CREATE OR REPLACE TABLE " + stats_table +
+	    " (kind VARCHAR, tbl VARCHAR, item VARCHAR, filters BIGINT, groups BIGINT)");
+	if (!rows.empty()) {
+		run("INSERT INTO " + stats_table + " VALUES " + StringUtil::Join(rows, ", "));
+	}
+	output.SetValue(
+	    0, 0, Value(bind_data.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : bind_data.catalog));
+	output.SetValue(1, 0, Value::BIGINT(NumericCast<int64_t>(rows.size())));
+	output.SetCardinality(1);
+}
+
+static void RawStatsLoadFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &bind_data = data.bind_data->Cast<RawStatsIOBindData>();
+	auto &state = data.global_state->Cast<RawOptimizeState>();
+	if (state.done) {
+		output.SetCardinality(0);
+		return;
+	}
+	state.done = true;
+
+	auto stats_table = StatsTable(context, bind_data.catalog);
+	Connection conn(*context.db);
+	auto result = conn.Query("SELECT kind, tbl, item, filters, groups FROM " + stats_table);
+	if (result->HasError()) {
+		result->ThrowError("RawDuck: ");
+	}
+	idx_t entries = 0;
+	{
+		auto &stats = GetStatsCache(context);
+		lock_guard<mutex> guard(stats.lock);
+		for (idx_t row = 0; row < result->RowCount(); row++) {
+			auto kind = result->GetValue(0, row).ToString();
+			auto table = result->GetValue(1, row).ToString();
+			auto item = result->GetValue(2, row).ToString();
+			auto filters = NumericCast<idx_t>(result->GetValue(3, row).GetValue<int64_t>());
+			auto groups = NumericCast<idx_t>(result->GetValue(4, row).GetValue<int64_t>());
+			if (kind == "column") {
+				stats.usage[table][item].filters += filters;
+				stats.usage[table][item].groups += groups;
+			} else if (kind == "group_set") {
+				stats.group_sets[table][item] += filters;
+			}
+			entries++;
+		}
+	}
+	output.SetValue(
+	    0, 0, Value(bind_data.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : bind_data.catalog));
+	output.SetValue(1, 0, Value::BIGINT(NumericCast<int64_t>(entries)));
+	output.SetCardinality(1);
+}
+
+TableFunctionSet GetRawStatsSaveFunction() {
+	TableFunctionSet set("raw_stats_save");
+	set.AddFunction(TableFunction("raw_stats_save", {}, RawStatsSaveFunction, RawStatsIOBind, RawOptimizeInit));
+	set.AddFunction(
+	    TableFunction("raw_stats_save", {LogicalType::VARCHAR}, RawStatsSaveFunction, RawStatsIOBind, RawOptimizeInit));
+	return set;
+}
+
+TableFunctionSet GetRawStatsLoadFunction() {
+	TableFunctionSet set("raw_stats_load");
+	set.AddFunction(TableFunction("raw_stats_load", {}, RawStatsLoadFunction, RawStatsIOBind, RawOptimizeInit));
+	set.AddFunction(
+	    TableFunction("raw_stats_load", {LogicalType::VARCHAR}, RawStatsLoadFunction, RawStatsIOBind, RawOptimizeInit));
+	return set;
 }
 
 TableFunction GetRawOptimizeFunction() {
