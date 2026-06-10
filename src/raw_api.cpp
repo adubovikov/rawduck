@@ -146,8 +146,19 @@ RawParseOptions RequestParseOptions(ClientContext &context, const duckdb_httplib
 	return options;
 }
 
+// OTLP responses use partialSuccess with a signal-specific rejected count
+const char *OtlpRejectedField(const string &signal) {
+	if (signal == "traces") {
+		return "rejectedSpans";
+	}
+	if (signal == "logs") {
+		return "rejectedLogRecords";
+	}
+	return "rejectedDataPoints";
+}
+
 void HandleIngest(const duckdb_httplib::Request &req, duckdb_httplib::Response &res, const string &table,
-                  const string &forced_transform) {
+                  const string &otlp_signal) {
 	auto db = RequireDatabase(res);
 	if (!db) {
 		return;
@@ -155,12 +166,25 @@ void HandleIngest(const duckdb_httplib::Request &req, duckdb_httplib::Response &
 	Connection conn(*db);
 	conn.BeginTransaction();
 	try {
-		auto options = forced_transform.empty() ? RequestParseOptions(*conn.context, req)
-		                                        : ResolveTransform(*conn.context, forced_transform, "");
+		auto options = otlp_signal.empty() ? RequestParseOptions(*conn.context, req)
+		                                   : ResolveTransform(*conn.context, "otlp-" + otlp_signal, "");
 		auto stats = RawIngestPayload(*conn.context, table, req.body, options);
 		conn.Commit();
 		JsonDoc json;
 		auto root = duckdb_yyjson::yyjson_mut_obj(json.doc);
+		if (!otlp_signal.empty()) {
+			// OTLP/HTTP success response: empty partialSuccess means fully
+			// accepted; rejected counts are reported per signal
+			auto partial = duckdb_yyjson::yyjson_mut_obj(json.doc);
+			if (stats.errors > 0) {
+				duckdb_yyjson::yyjson_mut_obj_add_uint(json.doc, partial, OtlpRejectedField(otlp_signal), stats.errors);
+				duckdb_yyjson::yyjson_mut_obj_add_str(json.doc, partial, "errorMessage",
+				                                      "some records could not be parsed");
+			}
+			duckdb_yyjson::yyjson_mut_obj_add_val(json.doc, root, "partialSuccess", partial);
+			Respond(res, 200, json, root);
+			return;
+		}
 		duckdb_yyjson::yyjson_mut_obj_add_strncpy(json.doc, root, "table", table.c_str(), table.size());
 		duckdb_yyjson::yyjson_mut_obj_add_uint(json.doc, root, "inserted", stats.rows);
 		duckdb_yyjson::yyjson_mut_obj_add_bool(json.doc, root, "created", stats.created);
@@ -307,9 +331,11 @@ void HandleDrop(duckdb_httplib::Response &res, const string &table) {
 
 void RegisterRoutes(duckdb_httplib::Server &server) {
 	// browser clients: permissive CORS, preflight handled globally
-	server.set_default_headers({{"Access-Control-Allow-Origin", "*"},
-	                            {"Access-Control-Allow-Headers", "Authorization, Content-Type, x-rawduck-table"},
-	                            {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"}});
+	server.set_default_headers(
+	    {{"Access-Control-Allow-Origin", "*"},
+	     {"Access-Control-Allow-Headers", "Authorization, Content-Type, x-rawduck-table, x-rawduck-traces-table, "
+	                                      "x-rawduck-logs-table, x-rawduck-metrics-table"},
+	     {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"}});
 	server.Options(R"(/.*)", [](const duckdb_httplib::Request &, duckdb_httplib::Response &res) { res.status = 204; });
 	server.Get("/health", [](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
 		res.set_content("{\"status\":\"ok\"}", "application/json");
@@ -345,15 +371,22 @@ void RegisterRoutes(duckdb_httplib::Server &server) {
 			            return;
 		            }
 		            if (req.get_header_value("Content-Type").find("protobuf") != string::npos) {
-			            RespondError(res, 415, "OTLP/protobuf is not supported; send OTLP/JSON");
+			            RespondError(res, 415,
+			                         "OTLP/protobuf is not supported; configure the SDK with "
+			                         "OTEL_EXPORTER_OTLP_PROTOCOL=http/json (for OTLP/gRPC SDKs, bridge through an "
+			                         "OpenTelemetry Collector)");
 			            return;
 		            }
 		            string signal = req.matches.groups[1].text;
-		            auto table = req.get_header_value("x-rawduck-table");
+		            // signal-specific table header, generic header, then default
+		            auto table = req.get_header_value("x-rawduck-" + signal + "-table");
+		            if (table.empty()) {
+			            table = req.get_header_value("x-rawduck-table");
+		            }
 		            if (table.empty()) {
 			            table = "otel_" + signal;
 		            }
-		            HandleIngest(req, res, table, "otlp-" + signal);
+		            HandleIngest(req, res, table, signal);
 	            });
 }
 

@@ -127,10 +127,31 @@ curl -X POST localhost:9999/v1/query -H "Authorization: Bearer rt_secret" \
 | `GET /v1/tables`, `GET /v1/tables/{t}` | list tables / describe schema |
 | `POST /v1/tables/{t}` | schema-less ingest (`?transform=`, `?explode=`, `?ignore_errors=true`) |
 | `DELETE /v1/tables/{t}` | drop table |
-| `POST /otlp/v1/{traces,logs,metrics}` | OTLP/JSON ingest with envelope unwrapping (`x-rawduck-table` header routes) |
+| `POST /otlp/v1/{traces,logs,metrics}` | OTLP/HTTP JSON ingest with envelope unwrapping and spec-shaped `partialSuccess` responses |
 
 Requests run on their own connections/transactions; a bearer `token` guards everything except
 `/health`; CORS is enabled for browser clients. Binds to localhost by default.
+
+### OpenTelemetry SDKs
+
+The OTLP routes follow the standard signal paths, so SDKs only need the endpoint base and the
+JSON encoding:
+
+```sh
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:9999/otlp
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer rt_secret"
+```
+
+Signals land in `otel_traces`, `otel_logs`, and `otel_metrics` by default; route them to custom
+tables with the `x-rawduck-traces-table`, `x-rawduck-logs-table`, or `x-rawduck-metrics-table`
+headers (the generic `x-rawduck-table` also works). Responses are OTLP-conformant: an empty
+`partialSuccess` on full acceptance, with signal-specific rejected counts otherwise.
+
+OTLP/protobuf and OTLP/gRPC are not served in-process (they would require the protobuf/gRPC
+stacks inside the extension). SDKs that only speak gRPC should bridge through an OpenTelemetry
+Collector — an `otlp` gRPC receiver on `:4317` exporting `otlphttp` with `encoding: json` to
+`http://localhost:9999/otlp` is all it takes.
 
 ## ATTACH: RawMergeTree stores
 
