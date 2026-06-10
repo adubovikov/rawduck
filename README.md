@@ -233,6 +233,9 @@ All RawMergeTree concepts from the RawTree design are implemented: schema-less e
 predicates with incremental re-sorting, the projection advisor with automatic aggregate rewriting,
 extensible ingest-time transforms, persisted statistics, RawDuck stores, and DuckLake fallback.
 
+See [BENCHMARK.md](BENCHMARK.md) to reproduce the numbers and [AGENTS.md](AGENTS.md) for the
+design guide.
+
 ---
 
 Based on the [DuckDB extension template](https://github.com/duckdb/extension-template).
