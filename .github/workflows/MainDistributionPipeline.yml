@@ -19,6 +19,10 @@ jobs:
       duckdb_version: v1.5.3
       ci_tools_version: v1.5-variegata
       extension_name: rawduck
+      # Windows is excluded until the VS2026 runner image is compatible with
+      # duckdb v1.5.3's vendored fmt (stdext::checked_array_iterator was
+      # removed from the MSVC STL).
+      exclude_archs: 'windows_amd64;windows_arm64;windows_amd64_mingw;windows_amd64_rtools'
 
   code-quality-check:
     name: Code Quality Check
