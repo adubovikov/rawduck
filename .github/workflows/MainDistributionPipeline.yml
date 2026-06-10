@@ -4,7 +4,15 @@
 name: Main Extension Distribution Pipeline
 on:
   push:
+    paths-ignore:
+      - '**.md'
+      - '**.yml'
+      - '**.yaml'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - '**.yml'
+      - '**.yaml'
   workflow_dispatch:
 
 concurrency:
