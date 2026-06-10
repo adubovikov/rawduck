@@ -134,7 +134,7 @@ SELECT count(*) FROM t_js WHERE v = '7';
 1
 
 #===----------------------------------------------------------------------===#
-# RawTree-style semantics: ints and floats group by value
+# RawMergeTree-style semantics: ints and floats group by value
 #===----------------------------------------------------------------------===#
 
 statement ok

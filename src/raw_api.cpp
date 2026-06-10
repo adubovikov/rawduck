@@ -12,8 +12,7 @@
 namespace duckdb {
 
 //===--------------------------------------------------------------------===//
-// raw_serve: an in-process HTTP API, loosely compatible with the RawTree API
-// (https://rawtree.com/docs/reference/api) for the functions RawDuck shares.
+// raw_serve: an in-process HTTP API for RawMergeTree-style ingestion and querying.
 //
 //   GET    /health                     {"status":"ok"}
 //   POST   /v1/query                   {"sql": "..."} -> meta/data/rows/statistics

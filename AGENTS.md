@@ -4,7 +4,8 @@ Orientation for LLMs, agents and developers continuing RawDuck. Read this before
 
 ## What RawDuck is
 
-A DuckDB extension implementing the RawMergeTree concept ([RawTree](https://rawtree.com/blog/introducing-rawtree)):
+A DuckDB extension implementing the RawMergeTree concept (loosely inspired by the design
+described at rawtree.com — keep mentions of that project to this single reference):
 **ingest schema-less JSON first, let the schema emerge**. The core bet: eagerly *shred* JSON into
 real typed columns at ingest (one-time cost) so every query runs at native columnar speed —
 instead of storing opaque JSON strings and paying `->>` extraction on every scan (45–265× slower,
@@ -26,7 +27,7 @@ release`; test with `./build/release/test/unittest --test-dir . "test/sql/*"`; f
 | `raw_transforms.cpp` | User-defined transform registry, `raw_transform_define()` scalar, `raw_transforms()`. |
 | `raw_attach.cpp` | `ATTACH 'rawduck:...'` storage extension (`RawDuckCatalog : DuckCatalog`). |
 | `raw_scalars.cpp` | `raw_type()`, `raw_infer()`. |
-| `raw_api.cpp` | `raw_serve()` / `raw_serve_stop()`: in-process HTTP API (RawTree-compatible endpoints) on DuckDB's vendored `duckdb_httplib`. |
+| `raw_api.cpp` | `raw_serve()` / `raw_serve_stop()`: in-process HTTP API on DuckDB's vendored `duckdb_httplib`. |
 
 ## Design invariants — do not break these
 
@@ -87,7 +88,7 @@ release`; test with `./build/release/test/unittest --test-dir . "test/sql/*"`; f
 
 - **Transparent `INSERT` auto-evolution is impossible**: `TableCatalogEntry::GetColumnIndex` /
   `GetColumns` are non-virtual and the binder resolves columns before any catalog hook. That's why
-  ingest is endpoint-shaped (`raw_ingest`), like RawTree's own API.
+  ingest is endpoint-shaped (`raw_ingest`), like hosted RawMergeTree services.
 - A storage extension whose catalog has `IsDuckCatalog() == true` gets a native
   `SingleFileStorageManager` automatically (`AttachedDatabase` ctor) — that's all
   `rawduck:` ATTACH needs.

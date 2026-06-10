@@ -30,7 +30,7 @@ struct ParsedDoc {
 
 } // namespace
 
-// raw_type: the RawTree dynamicType() equivalent, reports the concrete type
+// raw_type: a dynamicType()-style introspection function, reports the concrete type
 // of a JSON value. Unparseable input is treated as a plain string value.
 static void RawTypeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	UnaryExecutor::Execute<string_t, string_t>(args.data[0], result, args.size(), [&](string_t input) {

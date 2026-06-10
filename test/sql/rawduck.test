@@ -13,7 +13,7 @@ require rawduck
 require json
 
 #===----------------------------------------------------------------------===#
-# raw_type: concrete type of a JSON value (RawTree dynamicType equivalent)
+# raw_type: concrete type of a JSON value (dynamicType-style introspection)
 #===----------------------------------------------------------------------===#
 
 query I

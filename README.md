@@ -4,7 +4,7 @@
 
 **Schema-less JSON analytics for DuckDB, RawMergeTree style.**
 
-RawDuck brings the [RawMergeTree](https://rawtree.com/blog/introducing-rawtree) *"ingest first, schema later"* model to DuckDB:
+RawDuck brings the RawMergeTree *"ingest first, schema later"* model to DuckDB:
 throw raw JSON at a table that doesn't exist yet, and RawDuck creates it, types it, flattens it, and
 evolves it as the data changes shape — no `CREATE TABLE`, no schema declarations, no `json_extract`
 spaghetti at query time.
@@ -96,9 +96,9 @@ All ingest functions accept `transform := '...'`, `explode := '...'` and `ignore
 
 ## HTTP API
 
-RawDuck can serve an in-process HTTP API, loosely compatible with the
-[RawTree API](https://rawtree.com/docs/reference/api) (lifecycle patterns derived from the
-[quack](https://github.com/duckdb/duckdb-quack) client-server extension):
+RawDuck can serve an in-process HTTP API for RawMergeTree-style ingestion and querying
+(lifecycle patterns derived from the [quack](https://github.com/duckdb/duckdb-quack)
+client-server extension):
 
 ```sql
 SELECT * FROM raw_serve(host := '127.0.0.1', port := 9999, token := 'rt_secret');
@@ -268,7 +268,7 @@ All RawMergeTree concepts are implemented: schema-less evolving ingestion
 (native, transactional, pipelined, multi-threaded), adaptive physical layout from observed
 predicates with incremental re-sorting, the projection advisor with automatic aggregate rewriting,
 extensible ingest-time transforms, persisted statistics, RawDuck stores, DuckLake fallback, and
-an in-process HTTP API compatible with the RawTree endpoint surface.
+an in-process HTTP API for ingestion and querying.
 
 See [BENCHMARK.md](BENCHMARK.md) to reproduce the numbers and [AGENTS.md](AGENTS.md) for the
 design guide.

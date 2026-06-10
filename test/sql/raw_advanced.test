@@ -129,7 +129,7 @@ SELECT id, message, "logGroup" FROM raw_records('{"logGroup":"/aws/lambda/api","
 1	started	/aws/lambda/api
 2	done	/aws/lambda/api
 
-# named transform from the RawTree catalog
+# named transform from the built-in catalog
 query II
 SELECT id, "owner" FROM raw_records('{"owner":"123","logEvents":[{"id":7}]}', transform := 'cloudwatch-logs');
 ----
