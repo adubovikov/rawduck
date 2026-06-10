@@ -26,6 +26,7 @@ release`; test with `./build/release/test/unittest --test-dir . "test/sql/*"`; f
 | `raw_transforms.cpp` | User-defined transform registry, `raw_transform_define()` scalar, `raw_transforms()`. |
 | `raw_attach.cpp` | `ATTACH 'rawduck:...'` storage extension (`RawDuckCatalog : DuckCatalog`). |
 | `raw_scalars.cpp` | `raw_type()`, `raw_infer()`. |
+| `raw_api.cpp` | `raw_serve()` / `raw_serve_stop()`: in-process HTTP API (RawTree-compatible endpoints) on DuckDB's vendored `duckdb_httplib`. |
 
 ## Design invariants — do not break these
 
@@ -69,7 +70,15 @@ release`; test with `./build/release/test/unittest --test-dir . "test/sql/*"`; f
    best-effort collection only. Statistics live in `ObjectCache` (per `DatabaseInstance`,
    in-memory; `raw_stats_save/load` persist them explicitly).
 
-8. **Configuration is data, DuckDB-style.** User transforms are defined through a *scalar*
+8. **The HTTP API never shares a `ClientContext`.** Every request creates its own `Connection`
+   (own transaction); ingestion goes through `RawIngestPayload` inside an explicit
+   BeginTransaction/Commit with rollback on error. The listener thread is owned by a singleton
+   whose destructor stops and joins it — a joinable thread reaching a static destructor calls
+   `std::terminate`. The database is held via `weak_ptr` (503 after close, never use-after-free).
+   sqllogictests cover lifecycle only (start/double-start/stop/restart); endpoint behavior is
+   verified with curl (see README examples).
+
+9. **Configuration is data, DuckDB-style.** User transforms are defined through a *scalar*
    function (`raw_transform_define`) precisely so definitions compose with `read_json()` files,
    tables, or any query. Follow this pattern for new extensible features; don't invent config file
    formats or bespoke DDL.
@@ -97,7 +106,7 @@ release`; test with `./build/release/test/unittest --test-dir . "test/sql/*"`; f
 
 sqllogictests in `test/sql/`: `rawduck.test` (core types/records), `raw_ingest.test` (evolution),
 `raw_advanced.test` (streaming, transforms, pool, optimize, projections), `raw_attach.test`
-(stores, transactions, persistence), `ducklake.test` (`require ducklake`, skips when absent).
+(stores, transactions, persistence), `raw_api.test` (server lifecycle), `ducklake.test``ducklake.test` (`require ducklake`, skips when absent).
 Every feature needs: happy path, evolution interaction, error case, and—for anything that can
 return wrong data—a proof test (e.g. tampering with a projection to prove the rewrite engaged).
 `raw_ingest` output is `(table, created, columns_added, columns_widened, rows, errors)`;

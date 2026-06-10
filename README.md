@@ -267,7 +267,8 @@ predicate statistics + adaptive reordering, and DuckLake catalogs (`test/sql/duc
 All RawMergeTree concepts are implemented: schema-less evolving ingestion
 (native, transactional, pipelined, multi-threaded), adaptive physical layout from observed
 predicates with incremental re-sorting, the projection advisor with automatic aggregate rewriting,
-extensible ingest-time transforms, persisted statistics, RawDuck stores, and DuckLake fallback.
+extensible ingest-time transforms, persisted statistics, RawDuck stores, DuckLake fallback, and
+an in-process HTTP API compatible with the RawTree endpoint surface.
 
 See [BENCHMARK.md](BENCHMARK.md) to reproduce the numbers and [AGENTS.md](AGENTS.md) for the
 design guide.
