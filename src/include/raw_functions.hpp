@@ -25,6 +25,20 @@ ScalarFunction GetRawTransformDefineFunction();
 OptimizerExtension GetRawDuckOptimizerExtension();
 shared_ptr<StorageExtension> GetRawDuckStorageExtension();
 
+// programmatic ingest (HTTP API)
+struct RawIngestStats {
+	bool created = false;
+	idx_t columns_added = 0;
+	idx_t columns_widened = 0;
+	idx_t rows = 0;
+	idx_t errors = 0;
+};
+RawIngestStats RawIngestPayload(ClientContext &context, const string &target, const string &payload,
+                                const RawParseOptions &options);
+
+TableFunction GetRawServeFunction();
+TableFunction GetRawServeStopFunction();
+
 // shared SQL generation helpers
 string RawQuoteIdentifier(const string &name);
 string RawQualifiedTarget(const string &target);

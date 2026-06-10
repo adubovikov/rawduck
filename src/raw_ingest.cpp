@@ -749,6 +749,22 @@ private:
 	case_insensitive_map_t<LogicalType> fallback_types;
 };
 
+// Programmatic entry point (used by the HTTP API): runs a full ingest within
+// the caller's active transaction.
+RawIngestStats RawIngestPayload(ClientContext &context, const string &target, const string &payload,
+                                const RawParseOptions &options) {
+	RawIngestor ingestor(context, target, options);
+	ingestor.Ingest(payload);
+	ingestor.Finish();
+	RawIngestStats stats;
+	stats.created = ingestor.created;
+	stats.columns_added = ingestor.columns_added;
+	stats.columns_widened = ingestor.columns_widened;
+	stats.rows = ingestor.rows;
+	stats.errors = ingestor.errors;
+	return stats;
+}
+
 //===--------------------------------------------------------------------===//
 // raw_ingest(table, payload)
 //===--------------------------------------------------------------------===//

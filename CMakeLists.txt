@@ -14,6 +14,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include_directories(src/include)
 # DuckDB's vendored yyjson (namespaced as duckdb_yyjson)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/yyjson/include)
+# DuckDB's vendored cpp-httplib (namespace duckdb_httplib) for the API server
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/httplib)
 
 set(EXTENSION_SOURCES
     src/rawduck_extension.cpp
@@ -21,6 +23,7 @@ set(EXTENSION_SOURCES
     src/raw_records.cpp
     src/raw_ingest.cpp
     src/raw_attach.cpp
+    src/raw_api.cpp
     src/raw_transforms.cpp
     src/raw_optimize.cpp
     src/raw_scalars.cpp)

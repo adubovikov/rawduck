@@ -88,10 +88,44 @@ WHERE type = 'PushEvent' GROUP BY 1 ORDER BY pushes DESC LIMIT 10;           -- 
 | `raw_stats_save(catalog?)` / `raw_stats_load(catalog?)` | table | Persist observed statistics into a store (`__rawduck_stats` table) and merge them back after restart. |
 | `raw_projections()` | table | The projection advisor: GROUP BY shapes queries actually run, with observation counts and materialization status. |
 | `raw_project(table)` | table | RawMergeTree auto-projections: materializes the hottest observed aggregation as a lightweight `<table>__proj` summary table. |
+| `raw_serve(host, port, token)` / `raw_serve_stop()` | table | Start/stop the in-process HTTP API (see below). |
 | `raw_type(json)` | scalar | Concrete type of a JSON value (RawMergeTree's `dynamicType()`): `Null`, `Bool`, `Int64`, `UInt64`, `Double`, `String`, `Array`, `Object`. |
 | `raw_infer(json)` | scalar | The DuckDB type RawDuck assigns to a value, e.g. `BIGINT`, `DOUBLE[]`, or the flattened layout for objects: `OBJECT(a BIGINT, b.c VARCHAR)`. |
 
 All ingest functions accept `transform := '...'`, `explode := '...'` and `ignore_errors := true`.
+
+## HTTP API
+
+RawDuck can serve an in-process HTTP API, loosely compatible with the
+[RawTree API](https://rawtree.com/docs/reference/api) (lifecycle patterns derived from the
+[quack](https://github.com/duckdb/duckdb-quack) client-server extension):
+
+```sql
+SELECT * FROM raw_serve(host := '127.0.0.1', port := 9999, token := 'rt_secret');
+SELECT * FROM raw_serve_stop();
+```
+
+```sh
+curl -X POST localhost:9999/v1/tables/events -H "Authorization: Bearer rt_secret" \
+     -d '[{"action":"click","user":"alice","value":42}]'
+# {"table":"events","inserted":1,"created":true,"columns_added":3,"errors":0}
+
+curl -X POST localhost:9999/v1/query -H "Authorization: Bearer rt_secret" \
+     -d '{"sql":"SELECT action, count(*) FROM events GROUP BY action"}'
+# {"meta":[...],"data":[["click",1]],"rows":1,"statistics":{"elapsed":0.0016}}
+```
+
+| Endpoint | Behavior |
+|---|---|
+| `GET /health` | `{"status":"ok"}` |
+| `POST /v1/query` | `{"sql": "..."}` → `meta` / `data` / `rows` / `statistics` |
+| `GET /v1/tables`, `GET /v1/tables/{t}` | list tables / describe schema |
+| `POST /v1/tables/{t}` | schema-less ingest (`?transform=`, `?explode=`, `?ignore_errors=true`) |
+| `DELETE /v1/tables/{t}` | drop table |
+| `POST /otlp/v1/{traces,logs,metrics}` | OTLP/JSON ingest with envelope unwrapping (`x-rawduck-table` header routes) |
+
+Requests run on their own connections/transactions; a bearer `token` guards everything except
+`/health`; CORS is enabled for browser clients. Binds to localhost by default.
 
 ## ATTACH: RawMergeTree stores
 

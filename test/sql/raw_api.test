@@ -1,0 +1,40 @@
+# name: test/sql/raw_api.test
+# description: raw_serve lifecycle (endpoint behavior is exercised by curl in BENCHMARK/CI)
+# group: [sql]
+
+require rawduck
+
+require json
+
+query III
+SELECT * FROM raw_serve(host := '127.0.0.1', port := 19913, token := 'rt_secret');
+----
+127.0.0.1	19913	true
+
+# double-start is rejected
+statement error
+SELECT * FROM raw_serve(port := 19914);
+----
+<REGEX>:.*already running.*
+
+query I
+SELECT * FROM raw_serve_stop();
+----
+true
+
+# stop is idempotent
+query I
+SELECT * FROM raw_serve_stop();
+----
+false
+
+# restart works after stop
+query III
+SELECT * FROM raw_serve(port := 19913);
+----
+127.0.0.1	19913	false
+
+query I
+SELECT * FROM raw_serve_stop();
+----
+true
