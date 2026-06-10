@@ -244,3 +244,51 @@ query III
 SELECT count(*), count(extra), max(extra) FROM t_mt;
 ----
 25000	5000	7498.5
+
+#===----------------------------------------------------------------------===#
+# auto-projections: advisor observes aggregations, raw_project materializes
+#===----------------------------------------------------------------------===#
+
+statement ok
+SELECT * FROM raw_ingest('t_proj', '[{"k":"a","g":1},{"k":"b","g":1},{"k":"a","g":2}]');
+
+statement ok
+SELECT k, count(*) FROM t_proj GROUP BY k;
+
+statement ok
+SELECT k, count(*) FROM t_proj GROUP BY k;
+
+statement ok
+SELECT g, count(*) FROM t_proj GROUP BY g;
+
+query III
+SELECT group_columns, observed >= 1, projection IS NULL FROM raw_projections() WHERE "table" = 'memory.main.t_proj' ORDER BY group_columns;
+----
+g	true	true
+k	true	true
+
+query III
+SELECT projection, group_columns, rows FROM raw_project('t_proj');
+----
+t_proj__proj	k	2
+
+query II
+SELECT k, count FROM t_proj__proj ORDER BY k;
+----
+a	2
+b	1
+
+# advisor now shows the materialized projection
+query I
+SELECT projection FROM raw_projections() WHERE "table" = 'memory.main.t_proj' AND group_columns = 'k';
+----
+t_proj__proj
+
+# no observations: no-op
+statement ok
+SELECT * FROM raw_ingest('t_noproj', '[{"x":1}]');
+
+query II
+SELECT projection IS NULL, rows FROM raw_project('t_noproj');
+----
+true	0

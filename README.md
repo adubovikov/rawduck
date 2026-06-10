@@ -83,6 +83,8 @@ WHERE type = 'PushEvent' GROUP BY 1 ORDER BY pushes DESC LIMIT 10;           -- 
 | `raw_stats()` | table | Observed usage statistics per column: pushed-down filters and GROUP BY keys, collected automatically by an optimizer hook. |
 | `raw_optimize(table)` | table | RawMergeTree-style adaptive layout: physically reorders the table by its hottest columns (filters weighted over groupings, from `raw_stats`). |
 | `raw_transforms()` / `raw_transform_define(name, path)` | table / scalar | List and register ingest-time transforms; definitions compose with `read_json`, tables, or any query. |
+| `raw_projections()` | table | The projection advisor: GROUP BY shapes queries actually run, with observation counts and materialization status. |
+| `raw_project(table)` | table | RawMergeTree auto-projections: materializes the hottest observed aggregation as a lightweight `<table>__proj` summary table. |
 | `raw_type(json)` | scalar | Concrete type of a JSON value (RawTree's `dynamicType()`): `Null`, `Bool`, `Int64`, `UInt64`, `Double`, `String`, `Array`, `Object`. |
 | `raw_infer(json)` | scalar | The DuckDB type RawDuck assigns to a value, e.g. `BIGINT`, `DOUBLE[]`, or the flattened layout for objects: `OBJECT(a BIGINT, b.c VARCHAR)`. |
 
@@ -150,10 +152,12 @@ as data arrives (existing columns are `ALTER`ed in place, never rewritten destru
 - homogeneous scalar arrays become typed `LIST`s (`BIGINT[]`, nested `BIGINT[][]`, …)
 - nothing is ever dropped: structurally conflicting values are preserved verbatim as `JSON`
 
-## Adaptive layout from observed predicates
+## Adaptive layout from observed workloads
 
-An optimizer hook records every filter DuckDB pushes into a table scan; `raw_optimize` turns those
-observations into a physical sort order, RawMergeTree adaptive-primary-key style:
+An optimizer hook records every filter DuckDB pushes into a table scan and every GROUP BY
+column set. `raw_optimize` turns filter/group usage into a physical sort order
+(RawMergeTree adaptive primary keys); `raw_project` materializes the hottest aggregation
+as a summary table (RawMergeTree lightweight projections):
 
 ```sql
 SELECT count(*) FROM gh_events WHERE type = 'PushEvent';
@@ -165,6 +169,10 @@ SELECT * FROM raw_stats();
 
 SELECT * FROM raw_optimize('gh_events');
 -- gh_events | "type", "repo.id" | 247199
+
+SELECT type, count(*) FROM gh_events GROUP BY type;        -- observed by the advisor
+SELECT * FROM raw_project('gh_events');
+-- gh_events | gh_events__proj | type | 15                 -- pre-aggregated summary table
 ```
 
 ## DuckLake as a backend
@@ -203,16 +211,15 @@ make test
 ```
 
 The sqllogictests in `test/sql/` cover all standard JSON types, nested flattening, NDJSON, type
-widening, schema evolution, structural conflicts, streaming file ingestion, transforms,
+widening, schema evolution, structural conflicts, streaming file ingestion, multi-threaded appends, transforms, projections,
 error-tolerant ingestion, RawDuck stores (`ATTACH 'rawduck:...'`), transactional rollback,
 predicate statistics + adaptive reordering, and DuckLake catalogs (`test/sql/ducklake.test`).
 
 ## Roadmap
 
-- multi-threaded appends (parsing is already pipelined off-thread)
-- auto-projections for repeated low-cardinality aggregations
 - incremental `raw_optimize` (reorder only new row groups, RawMergeTree merge-style)
-- persisted predicate statistics inside RawDuck stores
+- persisted statistics and projection registry inside RawDuck stores
+- automatic aggregate rewriting onto materialized projections
 
 ---
 

@@ -19,6 +19,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(GetRawTypeFunction());
 	loader.RegisterFunction(GetRawInferFunction());
 	loader.RegisterFunction(GetRawTransformsFunction());
+	loader.RegisterFunction(GetRawProjectionsFunction());
+	loader.RegisterFunction(GetRawProjectFunction());
 	loader.RegisterFunction(GetRawTransformDefineFunction());
 
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
