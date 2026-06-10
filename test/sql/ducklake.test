@@ -8,7 +8,11 @@ require json
 
 require parquet
 
-require ducklake
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
 
 statement ok
 ATTACH 'ducklake:__TEST_DIR__/rawlake.ducklake' AS lake (DATA_PATH '__TEST_DIR__/rawlake_data');
