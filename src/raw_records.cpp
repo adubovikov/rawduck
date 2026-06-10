@@ -6,19 +6,41 @@
 namespace duckdb {
 
 struct RawRecordsBindData : public TableFunctionData {
-	// the schema tree must outlive the columns, which point into it
-	unique_ptr<RawPayload> payload;
-	unique_ptr<RawNode> root;
-	vector<RawColumn> columns;
+	shared_ptr<RawParsedPayload> parsed;
 };
 
 struct RawRecordsState : public GlobalTableFunctionState {
-	explicit RawRecordsState(const RawRecordsBindData &bind_data) : extractor(*bind_data.root, bind_data.columns) {
+	explicit RawRecordsState(const RawRecordsBindData &bind_data)
+	    : extractor(*bind_data.parsed->root, bind_data.parsed->columns) {
 	}
 
 	idx_t next_row = 0;
 	RawExtractor extractor;
 };
+
+string RawNamedStringParameter(const named_parameter_map_t &parameters, const string &name) {
+	auto entry = parameters.find(name);
+	if (entry == parameters.end() || entry->second.IsNull()) {
+		return string();
+	}
+	return entry->second.GetValue<string>();
+}
+
+RawParseOptions RawBindParseOptions(const named_parameter_map_t &parameters) {
+	auto options = ResolveTransform(RawNamedStringParameter(parameters, "transform"),
+	                                RawNamedStringParameter(parameters, "explode"));
+	auto ignore_entry = parameters.find("ignore_errors");
+	if (ignore_entry != parameters.end() && !ignore_entry->second.IsNull()) {
+		options.ignore_errors = ignore_entry->second.GetValue<bool>();
+	}
+	return options;
+}
+
+void RawAddIngestParameters(TableFunction &function) {
+	function.named_parameters["transform"] = LogicalType::VARCHAR;
+	function.named_parameters["explode"] = LogicalType::VARCHAR;
+	function.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
+}
 
 static unique_ptr<FunctionData> RawRecordsBind(ClientContext &context, TableFunctionBindInput &input,
                                                vector<LogicalType> &return_types, vector<string> &names) {
@@ -27,18 +49,15 @@ static unique_ptr<FunctionData> RawRecordsBind(ClientContext &context, TableFunc
 		throw InvalidInputException("RawDuck: payload may not be NULL");
 	}
 	auto payload_str = input.inputs[0].GetValue<string>();
-	result->payload = make_uniq<RawPayload>();
-	result->payload->Parse(payload_str);
-	result->root = result->payload->InferSchema();
-	result->columns = FlattenSchema(*result->root, result->payload->scalar_rows);
-	if (result->columns.empty()) {
+	result->parsed = RawParsedPayload::Process(payload_str, RawBindParseOptions(input.named_parameters));
+	if (result->parsed->columns.empty()) {
 		// empty payload: keep a valid (empty) result shape
 		return_types.push_back(LogicalType::JSON());
 		names.push_back("value");
-		result->payload->rows.clear();
+		result->parsed->payload.rows.clear();
 		return std::move(result);
 	}
-	for (auto &column : result->columns) {
+	for (auto &column : result->parsed->columns) {
 		return_types.push_back(column.type);
 		names.push_back(column.name);
 	}
@@ -52,14 +71,15 @@ static unique_ptr<GlobalTableFunctionState> RawRecordsInit(ClientContext &contex
 static void RawRecordsFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<RawRecordsBindData>();
 	auto &state = data.global_state->Cast<RawRecordsState>();
-	auto &rows = bind_data.payload->rows;
+	auto &rows = bind_data.parsed->payload.rows;
+	auto &columns = bind_data.parsed->columns;
 	auto count = MinValue<idx_t>(rows.size() - state.next_row, STANDARD_VECTOR_SIZE);
 	state.extractor.Reset(count);
 	for (idx_t i = 0; i < count; i++) {
 		state.extractor.AssignRow(rows[state.next_row + i], i);
 	}
-	for (idx_t col = 0; col < bind_data.columns.size(); col++) {
-		FillVector(state.extractor.ColumnValues(col), bind_data.columns[col].type, output.data[col], 0);
+	for (idx_t col = 0; col < columns.size(); col++) {
+		FillVector(state.extractor.ColumnValues(col), columns[col].type, output.data[col], 0);
 	}
 	state.next_row += count;
 	output.SetCardinality(count);
@@ -67,6 +87,7 @@ static void RawRecordsFunction(ClientContext &context, TableFunctionInput &data,
 
 TableFunction GetRawRecordsFunction() {
 	TableFunction function("raw_records", {LogicalType::VARCHAR}, RawRecordsFunction, RawRecordsBind, RawRecordsInit);
+	RawAddIngestParameters(function);
 	return function;
 }
 

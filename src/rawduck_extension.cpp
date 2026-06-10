@@ -6,6 +6,7 @@
 #include "duckdb.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/storage/storage_extension.hpp"
 
 namespace duckdb {
 
@@ -18,8 +19,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(GetRawTypeFunction());
 	loader.RegisterFunction(GetRawInferFunction());
 
+	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	// observe pushed-down predicates to drive raw_optimize()
-	OptimizerExtension::Register(DBConfig::GetConfig(loader.GetDatabaseInstance()), GetRawDuckOptimizerExtension());
+	OptimizerExtension::Register(config, GetRawDuckOptimizerExtension());
+	// ATTACH 'rawduck:store.db' AS raw
+	StorageExtension::Register(config, "rawduck", GetRawDuckStorageExtension());
 }
 
 void RawduckExtension::Load(ExtensionLoader &loader) {

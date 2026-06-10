@@ -1,0 +1,91 @@
+# name: test/sql/raw_attach.test
+# description: ATTACH 'rawduck:...' stores: native DuckDB queries over RawMergeTree tables
+# group: [sql]
+
+require rawduck
+
+require json
+
+statement ok
+ATTACH 'rawduck:__TEST_DIR__/store.db' AS raw;
+
+# the attached store identifies as a rawduck database
+query I
+SELECT type FROM duckdb_databases() WHERE database_name = 'raw';
+----
+rawduck
+
+# schema-less ingestion straight into the store
+query IIIIII
+SELECT * FROM raw_ingest('raw.events', '[{"id":1,"name":"a","ts":"2024-01-15T10:30:00"}]');
+----
+raw.events	true	3	0	1	0
+
+# regular DuckDB statements work transparently on RawMergeTree tables
+query III
+SELECT id, name, ts FROM raw.events;
+----
+1	a	2024-01-15 10:30:00
+
+statement ok
+INSERT INTO raw.events VALUES (2, 'b', '2024-01-15T11:00:00');
+
+statement ok
+UPDATE raw.events SET name = 'c' WHERE id = 2;
+
+query II
+SELECT id, name FROM raw.events ORDER BY id;
+----
+1	a
+2	c
+
+statement ok
+CREATE TABLE raw.manual AS SELECT 42 AS answer;
+
+query I
+SELECT answer FROM raw.manual;
+----
+42
+
+# schema evolution against the attached store
+query IIIIII
+SELECT * FROM raw_ingest('raw.events', '[{"id":3,"tags":["x","y"]}]');
+----
+raw.events	false	1	0	1	0
+
+query II
+SELECT id, tags FROM raw.events WHERE id = 3;
+----
+3	[x, y]
+
+# ingestion is transactional with the caller
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+SELECT * FROM raw_ingest('raw.events', '[{"id":4}]');
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM raw.events;
+----
+3
+
+# the store persists and reattaches
+statement ok
+DETACH raw;
+
+statement ok
+ATTACH 'rawduck:__TEST_DIR__/store.db' AS raw2;
+
+query I
+SELECT count(*) FROM raw2.events;
+----
+3
+
+query I
+SELECT name FROM raw2.events WHERE id = 2;
+----
+c

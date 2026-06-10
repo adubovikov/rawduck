@@ -9,42 +9,43 @@ spaghetti at query time.
 
 Where most engines keep schema-less data as opaque JSON strings (and pay for it at every query),
 RawDuck **shreds eagerly at ingest**: nested objects become real typed columns with dotted names,
-so queries run at native columnar speed.
+so queries run at native columnar speed. Ingestion runs through DuckDB's catalog and storage APIs
+directly, inside your transaction — `BEGIN` / `ROLLBACK` work exactly as you'd expect.
 
 ```sql
-LOAD rawduck;
+ATTACH 'rawduck:store.db' AS raw;
 
 -- no table 'events' exists yet
-SELECT * FROM raw_ingest('events', '[
+SELECT * FROM raw_ingest('raw.events', '[
     {"id": 1, "action": "click", "ts": "2024-01-15T10:30:00", "user": {"name": "alice", "plan": "pro"}},
     {"id": 2, "action": "view",  "ts": "2024-01-15T10:31:00", "user": {"name": "bob"}}
 ]');
--- ┌─────────┬─────────┬───────────────┬─────────────────┬──────┐
--- │  table  │ created │ columns_added │ columns_widened │ rows │
--- │ events  │ true    │             5 │               0 │    2 │
--- └─────────┴─────────┴───────────────┴─────────────────┴──────┘
 
-DESCRIBE events;
+DESCRIBE raw.events;
 -- id BIGINT, action VARCHAR, ts TIMESTAMP, user.name VARCHAR, user.plan VARCHAR
-
-SELECT "user.name", count(*) FROM events GROUP BY 1;   -- real columns, real speed
 ```
 
-Ingest again with a different shape and the table follows the data:
+RawMergeTree tables are regular DuckDB tables — every query, statement, and tool works
+transparently at native speed:
 
 ```sql
-SELECT * FROM raw_ingest('events', '[{"id": 3.5, "action": "buy", "amount": 99.5}]');
--- amount added as DOUBLE, id widened BIGINT -> DOUBLE, missing keys read as NULL
+SELECT "user.name", count(*) FROM raw.events GROUP BY 1;
+INSERT INTO raw.events VALUES (3, 'buy', now(), 'carol', 'pro');
+UPDATE raw.events SET "user.plan" = 'enterprise' WHERE id = 1;
+CREATE TABLE raw.daily AS SELECT date_trunc('day', ts) AS day, count(*) FROM raw.events GROUP BY 1;
 ```
 
-## Benchmark: typed columns vs a JSON column
+Ingest again with a different shape and the table follows the data: new keys become columns,
+conflicting types widen, missing keys read as `NULL` — nothing is ever dropped.
 
-One hour of real [GH Archive](https://www.gharchive.org/) data — **247,199 GitHub events, 956 MB
-of NDJSON, wildly heterogeneous payloads** (the same data RawBench uses). RawDuck ingested it with
-one `raw_ingest_file` call, automatically creating **914 typed columns**. The baseline is the
-standard DuckDB JSON extension pattern: a single `JSON` column queried with `->>` path extraction.
+## Benchmark: one hour of GitHub, three ways
 
-Identical queries, same machine (Apple Silicon, DuckDB v1.5.3), best of 3:
+Real [GH Archive](https://www.gharchive.org/) data — **247,199 GitHub events, 956 MB of NDJSON,
+wildly heterogeneous payloads** (the dataset RawBench uses). One `raw_ingest_file` call shredded it
+into **914 typed columns**, schema evolution included. The baseline is the standard DuckDB JSON
+extension pattern: a single `JSON` column queried with `->>` paths.
+
+Same machine (Apple Silicon, DuckDB v1.5.3), best of 3:
 
 | RawBench-style query | JSON column (`->>`) | RawDuck typed columns | speedup |
 |---|---:|---:|---:|
@@ -55,18 +56,17 @@ Identical queries, same machine (Apple Silicon, DuckDB v1.5.3), best of 3:
 | events per minute | 236 ms | 3 ms | **79×** |
 | *all five combined* | *1.46 s* | *18 ms* | **~80×** |
 
-Storage is smaller too, despite 914 columns: **627 MB** (typed + compressed) vs **1.05 GB** for the
-JSON-column table — the raw input was 956 MB.
+| | JSON column | RawDuck |
+|---|---:|---:|
+| ingest (full hour, 956 MB) | 1.4 s | **11.3 s** |
+| storage on disk | 1.05 GB | **627 MB** |
 
-The trade-off is ingest: shredding into 914 compressed columns costs ~190 s for the full hour
-(~1,300 events/s) vs ~1.4 s to load opaque JSON strings. Profiling shows the time goes into
-DuckDB's columnar storage itself (FSST/dictionary compression, WAL) — it's the one-time price of
-making every later query 45–265× faster.
-
-Example queries:
+Ingest runs at ~22,000 events/s (~85 MB/s) — a one-time cost within an order of magnitude of
+loading opaque JSON strings, in exchange for every later query being 45–265× faster and the data
+40% smaller on disk.
 
 ```sql
-SELECT * FROM raw_ingest_file('gh_events', '/data/2024-01-15-10.json');
+SELECT * FROM raw_ingest_file('gh_events', '/data/2024-01-15-10.json.gz');   -- 11.3s, 914 columns
 
 SELECT type, count(*) FROM gh_events GROUP BY type ORDER BY 2 DESC;          -- 1 ms
 SELECT "repo.name", count(*) AS pushes FROM gh_events
@@ -77,38 +77,48 @@ WHERE type = 'PushEvent' GROUP BY 1 ORDER BY pushes DESC LIMIT 10;           -- 
 
 | Function | Kind | Description |
 |---|---|---|
-| `raw_ingest(table, payload)` | table | Schema-less ingest: auto-creates the table, adds new columns, widens conflicting types, inserts. Accepts a JSON array, a single object, scalars, or NDJSON. Returns `(table, created, columns_added, columns_widened, rows)`. |
-| `raw_ingest_file(table, path, batch_size := 30000)` | table | Streaming ingest of NDJSON files (gzip auto-detected, any DuckDB filesystem). Reads in batches, evolving the schema between batches, with bounded memory. |
-| `raw_records(payload)` | table | Parse + infer + flatten a JSON payload into typed rows without touching any table. The pure-function core of `raw_ingest`, with vectorized row-major extraction. |
-| `raw_stats()` | table | Observed predicate statistics: which columns queries actually filter on, per table. Collected automatically by an optimizer hook from pushed-down filters. |
-| `raw_optimize(table)` | table | RawMergeTree-style adaptive layout: physically reorders the table by its most-filtered columns (from `raw_stats`), improving zone-map pruning. Returns the chosen `ORDER BY`. |
+| `raw_ingest(table, payload)` | table | Schema-less ingest: auto-creates the table, adds new columns, widens conflicting types, appends — natively, inside your transaction. Accepts a JSON array, a single object, scalars, or NDJSON. Returns `(table, created, columns_added, columns_widened, rows, errors)`. |
+| `raw_ingest_file(table, path, batch_size := 30000)` | table | Streaming ingest of NDJSON files (gzip auto-detected, any DuckDB filesystem) in bounded-memory batches, evolving the schema between batches. The whole file is one atomic operation. |
+| `raw_records(payload)` | table | Parse + infer + flatten a JSON payload into typed rows without touching any table. |
+| `raw_stats()` | table | Observed predicate statistics: which columns queries actually filter on, collected automatically from pushed-down filters. |
+| `raw_optimize(table)` | table | RawMergeTree-style adaptive layout: physically reorders the table by its most-filtered columns (from `raw_stats`). |
 | `raw_type(json)` | scalar | Concrete type of a JSON value (RawTree's `dynamicType()`): `Null`, `Bool`, `Int64`, `UInt64`, `Double`, `String`, `Array`, `Object`. |
-| `raw_infer(json)` | scalar | The DuckDB type RawDuck inference assigns to a value, e.g. `BIGINT`, `TIMESTAMP`, `DOUBLE[]`, or the full flattened layout for objects: `OBJECT(a BIGINT, b.c VARCHAR)`. |
+| `raw_infer(json)` | scalar | The DuckDB type RawDuck assigns to a value, e.g. `BIGINT`, `DOUBLE[]`, or the flattened layout for objects: `OBJECT(a BIGINT, b.c VARCHAR)`. |
 
-## Adaptive layout from observed predicates
+All ingest functions accept `transform := '...'`, `explode := '...'` and `ignore_errors := true`.
 
-Like RawMergeTree's adaptive primary keys, RawDuck watches how tables are actually queried.
-An optimizer hook records every filter that DuckDB pushes into a table scan; `raw_optimize`
-turns those observations into a physical sort order:
+## ATTACH: RawMergeTree stores
 
 ```sql
-SELECT count(*) FROM gh_events WHERE type = 'PushEvent';
-SELECT count(*) FROM gh_events WHERE type = 'WatchEvent';
-SELECT sum("payload.size") FROM gh_events WHERE type = 'PushEvent' AND "repo.id" > 700000000;
-
-SELECT * FROM raw_stats();
--- ┌─────────────────────┬─────────┬──────────────┐
--- │        table        │ column  │ filter_count │
--- │ memory.main.gh_events │ repo.id │            1 │
--- │ memory.main.gh_events │ type    │            3 │
--- └─────────────────────┴─────────┴──────────────┘
-
-SELECT * FROM raw_optimize('gh_events');
--- ┌───────────┬───────────────────┬────────┐
--- │   table   │     order_by      │  rows  │
--- │ gh_events │ "type", "repo.id" │ 247199 │
--- └───────────┴───────────────────┴────────┘
+ATTACH 'rawduck:store.db' AS raw;
 ```
+
+A RawDuck store is a native DuckDB database under a RawDuck-typed catalog: everything DuckDB can
+do — joins, window functions, updates, exports, other extensions — works on RawMergeTree tables
+transparently and at full native speed, while the store identifies itself for RawDuck's ingestion
+and adaptive-layout machinery. Stores persist and reattach like any database file.
+
+Note on transparency limits: DuckDB's binder resolves `INSERT` column lists against the current
+schema, so a plain `INSERT` cannot create tables or add columns (no catalog can change that —
+binding happens before any catalog hook). Schema-less creation and evolution flow through the
+ingest functions, which run in the same transaction as the rest of your statements.
+
+## Transforms
+
+Like RawTree, RawDuck reshapes envelope-style telemetry at ingest time: one row per nested event,
+with the wrapper's fields merged into each row.
+
+```sql
+-- {"owner":"123","logGroup":"/aws/lambda/api","logEvents":[{"id":"1","message":"started"},...]}
+SELECT * FROM raw_ingest('logs', payload, transform := 'cloudwatch-logs');
+-- one row per log event, with owner and logGroup columns on each
+
+-- the generic form works for any envelope shape
+SELECT * FROM raw_ingest('events', payload, explode := 'batch.items');
+```
+
+Built-in transform names: `cloudwatch-logs`, `cloudtrail`, `firehose`. Dirty NDJSON streams can be
+ingested with `ignore_errors := true`; skipped lines are counted in the `errors` column.
 
 ## The type lattice
 
@@ -128,12 +138,28 @@ as data arrives (existing columns are `ALTER`ed in place, never rewritten destru
 - homogeneous scalar arrays become typed `LIST`s (`BIGINT[]`, nested `BIGINT[][]`, …)
 - nothing is ever dropped: structurally conflicting values are preserved verbatim as `JSON`
 
+## Adaptive layout from observed predicates
+
+An optimizer hook records every filter DuckDB pushes into a table scan; `raw_optimize` turns those
+observations into a physical sort order, RawMergeTree adaptive-primary-key style:
+
+```sql
+SELECT count(*) FROM gh_events WHERE type = 'PushEvent';
+SELECT sum("payload.size") FROM gh_events WHERE type = 'PushEvent' AND "repo.id" > 700000000;
+
+SELECT * FROM raw_stats();
+-- gh_events | type    | 2
+-- gh_events | repo.id | 1
+
+SELECT * FROM raw_optimize('gh_events');
+-- gh_events | "type", "repo.id" | 247199
+```
+
 ## DuckLake as a backend
 
-`raw_ingest` speaks plain catalog SQL (`CREATE TABLE` / `ALTER TABLE ADD COLUMN` /
-`ALTER COLUMN SET DATA TYPE` / `INSERT`), so it works against any attached catalog —
-including [DuckLake](https://ducklake.select), which gets you schema-less ingestion straight
-into a lakehouse with snapshots and schema evolution tracked in the metadata:
+For non-native catalogs RawDuck falls back to catalog-level SQL, so schema-less ingestion also
+works against [DuckLake](https://ducklake.select) — straight into a lakehouse with snapshots and
+schema evolution tracked in the metadata:
 
 ```sql
 ATTACH 'ducklake:metadata.ducklake' AS lake (DATA_PATH 's3://bucket/raw');
@@ -164,17 +190,18 @@ Artifacts:
 make test
 ```
 
-The sqllogictests in `test/sql/` cover all standard JSON types (null, boolean, integer, double,
-string, array, object), nested flattening, NDJSON, type widening, schema evolution, structural
-conflicts, streaming file ingestion, predicate statistics + adaptive reordering, and ingestion
-into DuckLake catalogs (`test/sql/ducklake.test`, runs when the `ducklake` extension is available).
+The sqllogictests in `test/sql/` cover all standard JSON types, nested flattening, NDJSON, type
+widening, schema evolution, structural conflicts, streaming file ingestion, transforms,
+error-tolerant ingestion, RawDuck stores (`ATTACH 'rawduck:...'`), transactional rollback,
+predicate statistics + adaptive reordering, and DuckLake catalogs (`test/sql/ducklake.test`).
 
 ## Roadmap
 
-- parallel payload parsing and multi-threaded ingestion
+- parallel payload parsing and multi-threaded appends
+- OTLP transforms (`otlp-traces`, `otlp-logs`, `otlp-metrics`)
 - auto-projections for repeated low-cardinality aggregations
 - incremental `raw_optimize` (reorder only new row groups, RawMergeTree merge-style)
-- cardinality-aware `ORDER BY` selection (prefer low-cardinality leading columns)
+- persisted predicate statistics inside RawDuck stores
 
 ---
 

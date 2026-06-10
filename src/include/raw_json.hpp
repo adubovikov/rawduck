@@ -47,12 +47,22 @@ struct RawColumn {
 	const RawNode *node;
 };
 
+struct RawParseOptions {
+	// skip and count unparseable NDJSON lines instead of failing
+	bool ignore_errors = false;
+	// ingest-time transform: explode the array at this dotted path into one
+	// row per element, merging the envelope fields into each row
+	vector<string> explode_path;
+};
+
 // A parsed payload: one or more JSON documents and the row roots within them.
 struct RawPayload {
 	vector<duckdb_yyjson::yyjson_doc *> docs;
 	vector<duckdb_yyjson::yyjson_val *> rows;
 	// true when rows are bare scalars/arrays: they map to a single "value" column
 	bool scalar_rows = false;
+	// NDJSON lines skipped because they failed to parse (ignore_errors only)
+	idx_t parse_errors = 0;
 
 	RawPayload() = default;
 	RawPayload(const RawPayload &) = delete;
@@ -61,9 +71,27 @@ struct RawPayload {
 
 	// Accepts a JSON array of objects, a single object, or NDJSON; throws
 	// InvalidInputException otherwise.
-	void Parse(const string &payload);
+	void Parse(const string &payload, const RawParseOptions &options = RawParseOptions());
 	unique_ptr<RawNode> InferSchema() const;
+
+private:
+	void Explode(const vector<string> &path);
 };
+
+// A fully processed payload: parsed rows plus the inferred flattened schema.
+// Parsed exactly once and shared by inference and extraction.
+struct RawParsedPayload {
+	RawPayload payload;
+	unique_ptr<RawNode> root;
+	vector<RawColumn> columns;
+
+	static shared_ptr<RawParsedPayload> Process(const string &payload_text,
+	                                            const RawParseOptions &options = RawParseOptions());
+};
+
+// Resolves a transform name from the RawTree transform catalog (or a generic
+// dotted explode path) into parse options.
+RawParseOptions ResolveTransform(const string &transform, const string &explode);
 
 RawScalarKind JoinScalarKinds(RawScalarKind a, RawScalarKind b);
 RawScalarKind SniffScalarKind(duckdb_yyjson::yyjson_val *val);
@@ -101,5 +129,8 @@ private:
 };
 
 void FillVector(const vector<duckdb_yyjson::yyjson_val *> &vals, const LogicalType &type, Vector &result, idx_t offset);
+// whether FillVector can write this type directly (otherwise extract in the
+// inferred type and cast)
+bool RawFillSupported(const LogicalType &type);
 
 } // namespace duckdb

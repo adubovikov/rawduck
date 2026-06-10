@@ -13,10 +13,10 @@ require ducklake
 statement ok
 ATTACH 'ducklake:__TEST_DIR__/rawlake.ducklake' AS lake (DATA_PATH '__TEST_DIR__/rawlake_data');
 
-query IIIII
+query IIIIII
 SELECT * FROM raw_ingest('lake.main.events', '[{"id":1,"action":"click","ts":"2024-01-15T10:30:00"}]');
 ----
-lake.main.events	true	3	0	1
+lake.main.events	true	3	0	1	0
 
 query III
 SELECT id, action, ts FROM lake.main.events;
@@ -24,10 +24,10 @@ SELECT id, action, ts FROM lake.main.events;
 1	click	2024-01-15 10:30:00
 
 # schema evolution against the DuckLake catalog
-query IIIII
+query IIIIII
 SELECT * FROM raw_ingest('lake.main.events', '[{"id":2,"action":"view","user":{"name":"alice"}}]');
 ----
-lake.main.events	false	1	0	1
+lake.main.events	false	1	0	1	0
 
 query II
 SELECT id, "user.name" FROM lake.main.events ORDER BY id;
@@ -36,10 +36,10 @@ SELECT id, "user.name" FROM lake.main.events ORDER BY id;
 2	alice
 
 # type widening (BIGINT -> DOUBLE) through DuckLake type evolution
-query IIIII
+query IIIIII
 SELECT * FROM raw_ingest('lake.main.events', '[{"id":3.5,"action":"buy"}]');
 ----
-lake.main.events	false	0	1	1
+lake.main.events	false	0	1	1	0
 
 query I
 SELECT typeof(id) FROM lake.main.events LIMIT 1;

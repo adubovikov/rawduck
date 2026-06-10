@@ -10,10 +10,10 @@ require json
 # auto-create: table and typed columns appear on first ingest
 #===----------------------------------------------------------------------===#
 
-query IIIII
+query IIIIII
 SELECT * FROM raw_ingest('events', '[{"id":1,"action":"click","ts":"2024-01-15T10:30:00"},{"id":2,"action":"view","ts":"2024-01-15T10:31:00"}]');
 ----
-events	true	3	0	2
+events	true	3	0	2	0
 
 query II
 SELECT column_name, column_type FROM (DESCRIBE events);
@@ -32,10 +32,10 @@ SELECT id, action, ts FROM events ORDER BY id;
 # evolution: new keys add columns, old rows read as NULL, types widen
 #===----------------------------------------------------------------------===#
 
-query IIIII
+query IIIIII
 SELECT * FROM raw_ingest('events', '[{"id":3.5,"action":"buy","amount":99.5,"user":{"name":"alice"}}]');
 ----
-events	false	2	1	1
+events	false	2	1	1	0
 
 query I
 SELECT typeof(id) FROM events LIMIT 1;
@@ -62,10 +62,10 @@ SELECT count(*) FROM events WHERE ts IS NOT NULL;
 statement ok
 SELECT * FROM raw_ingest('t_mixed', '[{"v":1}]');
 
-query IIIII
+query IIIIII
 SELECT * FROM raw_ingest('t_mixed', '[{"v":"hello"}]');
 ----
-t_mixed	false	0	1	1
+t_mixed	false	0	1	1	0
 
 query I
 SELECT typeof(v) FROM t_mixed LIMIT 1;
@@ -85,10 +85,10 @@ hello
 statement ok
 SELECT * FROM raw_ingest('t_time', '[{"d":"2024-01-15"}]');
 
-query IIIII
+query IIIIII
 SELECT * FROM raw_ingest('t_time', '[{"d":"2024-01-15T10:30:00"}]');
 ----
-t_time	false	0	1	1
+t_time	false	0	1	1	0
 
 query II
 SELECT typeof(d), min(d) FROM t_time GROUP BY ALL;
@@ -103,10 +103,10 @@ TIMESTAMP	2024-01-15 00:00:00
 statement ok
 SELECT * FROM raw_ingest('t_arrmix', '[{"v":1}]');
 
-query IIIII
+query IIIIII
 SELECT * FROM raw_ingest('t_arrmix', '[{"v":[1,2]}]');
 ----
-t_arrmix	false	0	1	1
+t_arrmix	false	0	1	1	0
 
 query I
 SELECT typeof(v) FROM t_arrmix LIMIT 1;
@@ -123,10 +123,10 @@ SELECT v FROM t_arrmix ORDER BY 1;
 statement ok
 SELECT * FROM raw_ingest('t_js', '[{"v":{"a":1}},{"v":5}]');
 
-query IIIII
+query IIIIII
 SELECT * FROM raw_ingest('t_js', '[{"v":7}]');
 ----
-t_js	false	0	0	1
+t_js	false	0	0	1	0
 
 query I
 SELECT count(*) FROM t_js WHERE v = '7';
@@ -150,15 +150,15 @@ SELECT v, count(*) FROM t_grp GROUP BY v ORDER BY v;
 # NDJSON ingestion and scalar payloads
 #===----------------------------------------------------------------------===#
 
-query IIIII
+query IIIIII
 SELECT * FROM raw_ingest('t_nd', e'{"a":1}\n{"a":2,"b":"x"}');
 ----
-t_nd	true	2	0	2
+t_nd	true	2	0	2	0
 
-query IIIII
+query IIIIII
 SELECT * FROM raw_ingest('t_scalar', '[10,20,30]');
 ----
-t_scalar	true	1	0	3
+t_scalar	true	1	0	3	0
 
 query I
 SELECT sum(value) FROM t_scalar;
@@ -172,10 +172,10 @@ SELECT sum(value) FROM t_scalar;
 statement ok
 CREATE TABLE manual (id INTEGER, name VARCHAR);
 
-query IIIII
+query IIIIII
 SELECT * FROM raw_ingest('manual', '[{"id":1,"name":"a"},{"id":2,"name":"b"}]');
 ----
-manual	false	0	1	2
+manual	false	0	1	2	0
 
 # INTEGER was widened to the inferred BIGINT
 query I
@@ -203,7 +203,7 @@ SELECT * FROM raw_ingest(NULL, '[{"a":1}]');
 <REGEX>:.*may not be NULL.*
 
 # ingest into an existing table with an empty payload is a no-op
-query IIIII
+query IIIIII
 SELECT * FROM raw_ingest('t_grp', '[]');
 ----
-t_grp	false	0	0	0
+t_grp	false	0	0	0	0

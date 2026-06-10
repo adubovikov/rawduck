@@ -17,6 +17,8 @@ using duckdb_yyjson::yyjson_val;
 // Objects nested deeper than this are kept as JSON columns instead of being
 // flattened further.
 static constexpr idx_t RAW_MAX_FLATTEN_DEPTH = 16;
+// guard against pathological payloads exploding the table schema
+static constexpr idx_t RAW_MAX_COLUMNS = 10000;
 static constexpr auto RAW_READ_FLAGS = duckdb_yyjson::YYJSON_READ_ALLOW_INF_AND_NAN;
 
 //===--------------------------------------------------------------------===//
@@ -41,7 +43,21 @@ static void CollectRows(yyjson_val *root, vector<yyjson_val *> &rows) {
 	}
 }
 
-void RawPayload::Parse(const string &payload) {
+static void CheckRowUniformity(const vector<yyjson_val *> &rows, bool &scalar_rows) {
+	// rows must be uniformly objects, or uniformly non-objects ("value" column)
+	idx_t object_rows = 0;
+	for (auto row : rows) {
+		if (duckdb_yyjson::yyjson_is_obj(row)) {
+			object_rows++;
+		}
+	}
+	if (object_rows > 0 && object_rows != rows.size()) {
+		throw InvalidInputException("RawDuck: payload mixes JSON objects with non-object values");
+	}
+	scalar_rows = !rows.empty() && object_rows == 0;
+}
+
+void RawPayload::Parse(const string &payload, const RawParseOptions &options) {
 	auto doc = duckdb_yyjson::yyjson_read(payload.c_str(), payload.size(), RAW_READ_FLAGS);
 	if (doc) {
 		docs.push_back(doc);
@@ -72,6 +88,10 @@ void RawPayload::Parse(const string &payload) {
 			}
 			auto line_doc = duckdb_yyjson::yyjson_read(line_begin, line_len, RAW_READ_FLAGS);
 			if (!line_doc) {
+				if (options.ignore_errors) {
+					parse_errors++;
+					continue;
+				}
 				throw InvalidInputException("RawDuck: payload is not valid JSON or NDJSON (parse error on line %llu)",
 				                            line_number);
 			}
@@ -79,17 +99,79 @@ void RawPayload::Parse(const string &payload) {
 			rows.push_back(duckdb_yyjson::yyjson_doc_get_root(line_doc));
 		}
 	}
-	// rows must be uniformly objects, or uniformly non-objects ("value" column)
-	idx_t object_rows = 0;
+	CheckRowUniformity(rows, scalar_rows);
+	if (!options.explode_path.empty()) {
+		Explode(options.explode_path);
+	}
+}
+
+// Ingest-time transform: one output row per element of the array at `path`,
+// with the envelope's other top-level fields merged into each row. Rows
+// without the array pass through unchanged.
+void RawPayload::Explode(const vector<string> &path) {
+	auto mut_doc = duckdb_yyjson::yyjson_mut_doc_new(nullptr);
+	auto out_rows = duckdb_yyjson::yyjson_mut_arr(mut_doc);
+	duckdb_yyjson::yyjson_mut_doc_set_root(mut_doc, out_rows);
+
 	for (auto row : rows) {
-		if (duckdb_yyjson::yyjson_is_obj(row)) {
-			object_rows++;
+		auto arr = row;
+		for (auto &segment : path) {
+			arr = arr && duckdb_yyjson::yyjson_is_obj(arr)
+			          ? duckdb_yyjson::yyjson_obj_getn(arr, segment.c_str(), segment.size())
+			          : nullptr;
+		}
+		if (!arr || !duckdb_yyjson::yyjson_is_arr(arr)) {
+			duckdb_yyjson::yyjson_mut_arr_append(out_rows, duckdb_yyjson::yyjson_val_mut_copy(mut_doc, row));
+			continue;
+		}
+		duckdb_yyjson::yyjson_arr_iter elements;
+		duckdb_yyjson::yyjson_arr_iter_init(arr, &elements);
+		while (auto element = duckdb_yyjson::yyjson_arr_iter_next(&elements)) {
+			if (!duckdb_yyjson::yyjson_is_obj(element)) {
+				duckdb_yyjson::yyjson_mut_arr_append(out_rows, duckdb_yyjson::yyjson_val_mut_copy(mut_doc, element));
+				continue;
+			}
+			auto merged = duckdb_yyjson::yyjson_mut_obj(mut_doc);
+			// element fields first: they win over envelope fields on collision
+			yyjson_obj_iter iter;
+			duckdb_yyjson::yyjson_obj_iter_init(element, &iter);
+			while (auto key = duckdb_yyjson::yyjson_obj_iter_next(&iter)) {
+				auto key_copy = duckdb_yyjson::yyjson_mut_strncpy(mut_doc, duckdb_yyjson::yyjson_get_str(key),
+				                                                  duckdb_yyjson::yyjson_get_len(key));
+				duckdb_yyjson::yyjson_mut_obj_add(
+				    merged, key_copy,
+				    duckdb_yyjson::yyjson_val_mut_copy(mut_doc, duckdb_yyjson::yyjson_obj_iter_get_val(key)));
+			}
+			duckdb_yyjson::yyjson_obj_iter_init(row, &iter);
+			while (auto key = duckdb_yyjson::yyjson_obj_iter_next(&iter)) {
+				auto key_str = duckdb_yyjson::yyjson_get_str(key);
+				auto key_len = duckdb_yyjson::yyjson_get_len(key);
+				if (string(key_str, key_len) == path[0] ||
+				    duckdb_yyjson::yyjson_mut_obj_getn(merged, key_str, key_len)) {
+					continue;
+				}
+				auto key_copy = duckdb_yyjson::yyjson_mut_strncpy(mut_doc, key_str, key_len);
+				duckdb_yyjson::yyjson_mut_obj_add(
+				    merged, key_copy,
+				    duckdb_yyjson::yyjson_val_mut_copy(mut_doc, duckdb_yyjson::yyjson_obj_iter_get_val(key)));
+			}
+			duckdb_yyjson::yyjson_mut_arr_append(out_rows, merged);
 		}
 	}
-	if (object_rows > 0 && object_rows != rows.size()) {
-		throw InvalidInputException("RawDuck: payload mixes JSON objects with non-object values");
+
+	auto exploded = duckdb_yyjson::yyjson_mut_doc_imut_copy(mut_doc, nullptr);
+	duckdb_yyjson::yyjson_mut_doc_free(mut_doc);
+	if (!exploded) {
+		throw InternalException("RawDuck: failed to materialize exploded payload");
 	}
-	scalar_rows = !rows.empty() && object_rows == 0;
+	for (auto old_doc : docs) {
+		duckdb_yyjson::yyjson_doc_free(old_doc);
+	}
+	docs.clear();
+	rows.clear();
+	docs.push_back(exploded);
+	CollectRows(duckdb_yyjson::yyjson_doc_get_root(exploded), rows);
+	CheckRowUniformity(rows, scalar_rows);
 }
 
 unique_ptr<RawNode> RawPayload::InferSchema() const {
@@ -98,6 +180,40 @@ unique_ptr<RawNode> RawPayload::InferSchema() const {
 		MergeValue(*root, row);
 	}
 	return root;
+}
+
+shared_ptr<RawParsedPayload> RawParsedPayload::Process(const string &payload_text, const RawParseOptions &options) {
+	auto result = make_shared_ptr<RawParsedPayload>();
+	result->payload.Parse(payload_text, options);
+	result->root = result->payload.InferSchema();
+	result->columns = FlattenSchema(*result->root, result->payload.scalar_rows);
+	return result;
+}
+
+RawParseOptions ResolveTransform(const string &transform, const string &explode) {
+	if (!transform.empty() && !explode.empty()) {
+		throw InvalidInputException("RawDuck: specify either transform or explode, not both");
+	}
+	string path = explode;
+	if (!transform.empty()) {
+		auto name = StringUtil::Lower(transform);
+		if (name == "cloudwatch-logs") {
+			path = "logEvents";
+		} else if (name == "cloudtrail") {
+			path = "Records";
+		} else if (name == "firehose") {
+			path = "records";
+		} else {
+			throw InvalidInputException("RawDuck: unknown transform '%s' (supported: cloudwatch-logs, cloudtrail, "
+			                            "firehose; or use explode := 'dotted.path')",
+			                            transform);
+		}
+	}
+	RawParseOptions options;
+	if (!path.empty()) {
+		options.explode_path = StringUtil::Split(path, '.');
+	}
+	return options;
 }
 
 //===--------------------------------------------------------------------===//
@@ -311,6 +427,12 @@ vector<RawColumn> FlattenSchema(const RawNode &root, bool scalar_rows) {
 	}
 	vector<string> path;
 	FlattenInto(root, "", path, 0, result);
+	if (result.size() > RAW_MAX_COLUMNS) {
+		throw InvalidInputException(
+		    "RawDuck: payload flattens to %llu columns, exceeding the limit of %llu; restructure the payload or "
+		    "reduce key cardinality",
+		    result.size(), RAW_MAX_COLUMNS);
+	}
 	// flattening can collide (e.g. key "a.b" vs nested a->b): disambiguate
 	case_insensitive_set_t seen;
 	for (auto &column : result) {
@@ -330,6 +452,25 @@ vector<RawColumn> FlattenSchema(const RawNode &root, bool scalar_rows) {
 
 bool IsRawJSONType(const LogicalType &type) {
 	return type.id() == LogicalTypeId::VARCHAR && type.GetAlias() == LogicalType::JSON_TYPE_NAME;
+}
+
+bool RawFillSupported(const LogicalType &type) {
+	if (IsRawJSONType(type)) {
+		return true;
+	}
+	switch (type.id()) {
+	case LogicalTypeId::BOOLEAN:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::VARCHAR:
+		return true;
+	case LogicalTypeId::LIST:
+		return RawFillSupported(ListType::GetChildType(type));
+	default:
+		return false;
+	}
 }
 
 RawExtractor::RawExtractor(const RawNode &root_p, const vector<RawColumn> &columns) : root(root_p) {
