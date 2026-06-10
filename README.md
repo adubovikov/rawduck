@@ -1,8 +1,10 @@
-# 🦆 RawDuck
+<img width="120" alt="rawduck" src="https://github.com/user-attachments/assets/e44ee764-7639-433c-b904-03a2d4ee38e2" /> 
+
+# RawDuck
 
 **Schema-less JSON analytics for DuckDB, RawMergeTree style.**
 
-RawDuck brings the [RawTree](https://rawtree.com/blog/introducing-rawtree) *"ingest first, schema later"* model to DuckDB:
+RawDuck brings the [RawMergeTree](https://rawtree.com/blog/introducing-rawtree) *"ingest first, schema later"* model to DuckDB:
 throw raw JSON at a table that doesn't exist yet, and RawDuck creates it, types it, flattens it, and
 evolves it as the data changes shape — no `CREATE TABLE`, no schema declarations, no `json_extract`
 spaghetti at query time.
@@ -86,7 +88,7 @@ WHERE type = 'PushEvent' GROUP BY 1 ORDER BY pushes DESC LIMIT 10;           -- 
 | `raw_stats_save(catalog?)` / `raw_stats_load(catalog?)` | table | Persist observed statistics into a store (`__rawduck_stats` table) and merge them back after restart. |
 | `raw_projections()` | table | The projection advisor: GROUP BY shapes queries actually run, with observation counts and materialization status. |
 | `raw_project(table)` | table | RawMergeTree auto-projections: materializes the hottest observed aggregation as a lightweight `<table>__proj` summary table. |
-| `raw_type(json)` | scalar | Concrete type of a JSON value (RawTree's `dynamicType()`): `Null`, `Bool`, `Int64`, `UInt64`, `Double`, `String`, `Array`, `Object`. |
+| `raw_type(json)` | scalar | Concrete type of a JSON value (RawMergeTree's `dynamicType()`): `Null`, `Bool`, `Int64`, `UInt64`, `Double`, `String`, `Array`, `Object`. |
 | `raw_infer(json)` | scalar | The DuckDB type RawDuck assigns to a value, e.g. `BIGINT`, `DOUBLE[]`, or the flattened layout for objects: `OBJECT(a BIGINT, b.c VARCHAR)`. |
 
 All ingest functions accept `transform := '...'`, `explode := '...'` and `ignore_errors := true`.
@@ -109,7 +111,7 @@ ingest functions, which run in the same transaction as the rest of your statemen
 
 ## Transforms
 
-Like RawTree, RawDuck reshapes envelope-style telemetry at ingest time: one row per nested event,
+RawDuck reshapes envelope-style telemetry at ingest time: one row per nested event,
 with the wrapper's fields merged into each row.
 
 ```sql
@@ -228,7 +230,7 @@ predicate statistics + adaptive reordering, and DuckLake catalogs (`test/sql/duc
 
 ## Status
 
-All RawMergeTree concepts from the RawTree design are implemented: schema-less evolving ingestion
+All RawMergeTree concepts are implemented: schema-less evolving ingestion
 (native, transactional, pipelined, multi-threaded), adaptive physical layout from observed
 predicates with incremental re-sorting, the projection advisor with automatic aggregate rewriting,
 extensible ingest-time transforms, persisted statistics, RawDuck stores, and DuckLake fallback.
