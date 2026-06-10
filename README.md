@@ -4,15 +4,23 @@
 
 **Schema-less JSON analytics for DuckDB, RawMergeTree style.**
 
-RawDuck brings the RawMergeTree *"ingest first, schema later"* model to DuckDB:
-throw raw JSON at a table that doesn't exist yet, and RawDuck creates it, types it, flattens it, and
-evolves it as the data changes shape — no `CREATE TABLE`, no schema declarations, no `json_extract`
-spaghetti at query time.
+RawDuck brings the RawMergeTree *"ingest first, schema later"* model to DuckDB: point raw JSON,
+NDJSON files, or OTLP telemetry at tables that don't exist yet — RawDuck creates them, types them,
+flattens nested objects into real columns, and evolves the schema as the data changes shape. No
+`CREATE TABLE`, no schema declarations, no `json_extract` at query time. Because data lands
+shredded into native typed columns instead of opaque JSON strings, analytical queries run
+**45–265× faster** on **40% less disk** than the JSON-column approach (see the benchmark below).
 
-Where most engines keep schema-less data as opaque JSON strings (and pay for it at every query),
-RawDuck **shreds eagerly at ingest**: nested objects become real typed columns with dotted names,
-so queries run at native columnar speed. Ingestion runs through DuckDB's catalog and storage APIs
-directly, inside your transaction — `BEGIN` / `ROLLBACK` work exactly as you'd expect.
+It is a complete engine rather than a parser: ingestion is transactional, pipelined, and
+multi-threaded through DuckDB's own catalog and storage APIs (`BEGIN`/`ROLLBACK` behave exactly as
+expected); the optimizer observes the workload and adapts — physically re-sorting tables by the
+columns queries actually filter on (incrementally, MergeTree-parts style) and answering recurring
+aggregations from advisor-driven projections. Envelope telemetry (CloudWatch, CloudTrail, OTLP
+traces/logs/metrics) unwraps into one row per event through built-in or user-defined transforms,
+an embedded **HTTP API** accepts ingestion and SQL over the wire, `ATTACH 'rawduck:store.db'`
+provides persistent stores that behave like ordinary DuckDB databases, and DuckLake serves as a
+lakehouse backend. One `LOAD rawduck` turns DuckDB into a schema-less analytics engine for modern
+data, observability, and beyond.
 
 ```sql
 ATTACH 'rawduck:store.db' AS raw;
