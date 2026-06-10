@@ -1,0 +1,105 @@
+#pragma once
+
+#include "duckdb.hpp"
+#include "yyjson.hpp"
+
+namespace duckdb {
+
+//===--------------------------------------------------------------------===//
+// RawDuck schema inference
+//
+// Implements the RawMergeTree-style "ingest first, schema later" model:
+// every JSON payload is merged into a schema tree where scalar types widen
+// along a lattice and structural conflicts degrade to JSON. Nested objects
+// are flattened into dotted column paths so values land in real typed
+// columns instead of opaque JSON strings.
+//===--------------------------------------------------------------------===//
+
+// Scalar widening lattice: UNSET < BOOLEAN | BIGINT < DOUBLE | DATE < TIMESTAMP,
+// any other combination joins to VARCHAR (the universal scalar sink).
+enum class RawScalarKind : uint8_t { UNSET = 0, BOOLEAN, BIGINT, DOUBLE, DATE, TIMESTAMP, VARCHAR };
+
+enum class RawNodeClass : uint8_t {
+	UNSET = 0, // only nulls seen so far
+	SCALAR,    // scalar values, type tracked in `scalar`
+	OBJECT,    // nested object, children flattened into dotted columns
+	ARRAY,     // homogeneous array, element type tracked in `element`
+	JSON       // structural conflict or unflattenable value: stored as JSON text
+};
+
+struct RawNode {
+	RawNodeClass node_class = RawNodeClass::UNSET;
+	RawScalarKind scalar = RawScalarKind::UNSET;
+	// object children in first-seen order, so inferred column order is stable
+	vector<pair<string, unique_ptr<RawNode>>> children;
+	unordered_map<string, idx_t> child_lookup;
+	unique_ptr<RawNode> element;
+
+	RawNode &GetOrCreateChild(const string &key);
+};
+
+// A flattened output column: `name` is the dotted path, `path` the segments to
+// walk in each JSON row, `node` points into the schema tree owned by the caller.
+struct RawColumn {
+	string name;
+	vector<string> path;
+	LogicalType type;
+	const RawNode *node;
+};
+
+// A parsed payload: one or more JSON documents and the row roots within them.
+struct RawPayload {
+	vector<duckdb_yyjson::yyjson_doc *> docs;
+	vector<duckdb_yyjson::yyjson_val *> rows;
+	// true when rows are bare scalars/arrays: they map to a single "value" column
+	bool scalar_rows = false;
+
+	RawPayload() = default;
+	RawPayload(const RawPayload &) = delete;
+	RawPayload &operator=(const RawPayload &) = delete;
+	~RawPayload();
+
+	// Accepts a JSON array of objects, a single object, or NDJSON; throws
+	// InvalidInputException otherwise.
+	void Parse(const string &payload);
+	unique_ptr<RawNode> InferSchema() const;
+};
+
+RawScalarKind JoinScalarKinds(RawScalarKind a, RawScalarKind b);
+RawScalarKind SniffScalarKind(duckdb_yyjson::yyjson_val *val);
+void MergeValue(RawNode &node, duckdb_yyjson::yyjson_val *val);
+
+LogicalType NodeToType(const RawNode &node);
+vector<RawColumn> FlattenSchema(const RawNode &root, bool scalar_rows);
+
+bool IsRawJSONType(const LogicalType &type);
+
+// Vectorized extraction. Rows are typically sparse compared to the unified
+// schema, so extraction is row-major: each row's JSON tree is traversed once
+// and values are routed to their column slot via the schema-tree nodes.
+class RawExtractor {
+public:
+	RawExtractor(const RawNode &root, const vector<RawColumn> &columns);
+
+	// Routes one row's values into per-column slots at `row_idx`. Slots for
+	// absent paths keep their nullptr from Reset().
+	void AssignRow(duckdb_yyjson::yyjson_val *row, idx_t row_idx);
+	void Reset(idx_t row_count);
+
+	const vector<duckdb_yyjson::yyjson_val *> &ColumnValues(idx_t col) const {
+		return values[col];
+	}
+
+private:
+	void Traverse(duckdb_yyjson::yyjson_val *val, const RawNode &node, idx_t row_idx);
+
+	const RawNode &root;
+	// schema-tree leaf -> column slot
+	unordered_map<const RawNode *, idx_t> column_of;
+	bool root_is_column = false;
+	vector<vector<duckdb_yyjson::yyjson_val *>> values;
+};
+
+void FillVector(const vector<duckdb_yyjson::yyjson_val *> &vals, const LogicalType &type, Vector &result, idx_t offset);
+
+} // namespace duckdb

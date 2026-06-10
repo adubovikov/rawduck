@@ -1,0 +1,209 @@
+# name: test/sql/raw_ingest.test
+# description: RawDuck schema-less ingestion: auto-create, evolve and widen tables
+# group: [sql]
+
+require rawduck
+
+require json
+
+#===----------------------------------------------------------------------===#
+# auto-create: table and typed columns appear on first ingest
+#===----------------------------------------------------------------------===#
+
+query IIIII
+SELECT * FROM raw_ingest('events', '[{"id":1,"action":"click","ts":"2024-01-15T10:30:00"},{"id":2,"action":"view","ts":"2024-01-15T10:31:00"}]');
+----
+events	true	3	0	2
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE events);
+----
+id	BIGINT
+action	VARCHAR
+ts	TIMESTAMP
+
+query III
+SELECT id, action, ts FROM events ORDER BY id;
+----
+1	click	2024-01-15 10:30:00
+2	view	2024-01-15 10:31:00
+
+#===----------------------------------------------------------------------===#
+# evolution: new keys add columns, old rows read as NULL, types widen
+#===----------------------------------------------------------------------===#
+
+query IIIII
+SELECT * FROM raw_ingest('events', '[{"id":3.5,"action":"buy","amount":99.5,"user":{"name":"alice"}}]');
+----
+events	false	2	1	1
+
+query I
+SELECT typeof(id) FROM events LIMIT 1;
+----
+DOUBLE
+
+query IIII
+SELECT id, action, amount, "user.name" FROM events ORDER BY id;
+----
+1.0	click	NULL	NULL
+2.0	view	NULL	NULL
+3.5	buy	99.5	alice
+
+# rows missing in the payload do not lose data
+query I
+SELECT count(*) FROM events WHERE ts IS NOT NULL;
+----
+2
+
+#===----------------------------------------------------------------------===#
+# widening to VARCHAR on incompatible scalars
+#===----------------------------------------------------------------------===#
+
+statement ok
+SELECT * FROM raw_ingest('t_mixed', '[{"v":1}]');
+
+query IIIII
+SELECT * FROM raw_ingest('t_mixed', '[{"v":"hello"}]');
+----
+t_mixed	false	0	1	1
+
+query I
+SELECT typeof(v) FROM t_mixed LIMIT 1;
+----
+VARCHAR
+
+query I
+SELECT v FROM t_mixed ORDER BY v;
+----
+1
+hello
+
+#===----------------------------------------------------------------------===#
+# DATE widens to TIMESTAMP
+#===----------------------------------------------------------------------===#
+
+statement ok
+SELECT * FROM raw_ingest('t_time', '[{"d":"2024-01-15"}]');
+
+query IIIII
+SELECT * FROM raw_ingest('t_time', '[{"d":"2024-01-15T10:30:00"}]');
+----
+t_time	false	0	1	1
+
+query II
+SELECT typeof(d), min(d) FROM t_time GROUP BY ALL;
+----
+TIMESTAMP	2024-01-15 00:00:00
+
+#===----------------------------------------------------------------------===#
+# structural conflicts degrade to JSON
+#===----------------------------------------------------------------------===#
+
+# scalar column hit by an array value
+statement ok
+SELECT * FROM raw_ingest('t_arrmix', '[{"v":1}]');
+
+query IIIII
+SELECT * FROM raw_ingest('t_arrmix', '[{"v":[1,2]}]');
+----
+t_arrmix	false	0	1	1
+
+query I
+SELECT typeof(v) FROM t_arrmix LIMIT 1;
+----
+JSON
+
+query I
+SELECT v FROM t_arrmix ORDER BY 1;
+----
+1
+[1,2]
+
+# in-payload object/scalar conflict lands as JSON, later scalars are wrapped
+statement ok
+SELECT * FROM raw_ingest('t_js', '[{"v":{"a":1}},{"v":5}]');
+
+query IIIII
+SELECT * FROM raw_ingest('t_js', '[{"v":7}]');
+----
+t_js	false	0	0	1
+
+query I
+SELECT count(*) FROM t_js WHERE v = '7';
+----
+1
+
+#===----------------------------------------------------------------------===#
+# RawTree-style semantics: ints and floats group by value
+#===----------------------------------------------------------------------===#
+
+statement ok
+SELECT * FROM raw_ingest('t_grp', '[{"v":1},{"v":1.0},{"v":2}]');
+
+query II
+SELECT v, count(*) FROM t_grp GROUP BY v ORDER BY v;
+----
+1.0	2
+2.0	1
+
+#===----------------------------------------------------------------------===#
+# NDJSON ingestion and scalar payloads
+#===----------------------------------------------------------------------===#
+
+query IIIII
+SELECT * FROM raw_ingest('t_nd', e'{"a":1}\n{"a":2,"b":"x"}');
+----
+t_nd	true	2	0	2
+
+query IIIII
+SELECT * FROM raw_ingest('t_scalar', '[10,20,30]');
+----
+t_scalar	true	1	0	3
+
+query I
+SELECT sum(value) FROM t_scalar;
+----
+60
+
+#===----------------------------------------------------------------------===#
+# ingestion into pre-existing user tables
+#===----------------------------------------------------------------------===#
+
+statement ok
+CREATE TABLE manual (id INTEGER, name VARCHAR);
+
+query IIIII
+SELECT * FROM raw_ingest('manual', '[{"id":1,"name":"a"},{"id":2,"name":"b"}]');
+----
+manual	false	0	1	2
+
+# INTEGER was widened to the inferred BIGINT
+query I
+SELECT typeof(id) FROM manual LIMIT 1;
+----
+BIGINT
+
+#===----------------------------------------------------------------------===#
+# error handling
+#===----------------------------------------------------------------------===#
+
+statement error
+SELECT * FROM raw_ingest('t_empty', '[]');
+----
+<REGEX>:.*empty payload.*
+
+statement error
+SELECT * FROM raw_ingest('t_bad', '{invalid');
+----
+<REGEX>:.*not valid JSON.*
+
+statement error
+SELECT * FROM raw_ingest(NULL, '[{"a":1}]');
+----
+<REGEX>:.*may not be NULL.*
+
+# ingest into an existing table with an empty payload is a no-op
+query IIIII
+SELECT * FROM raw_ingest('t_grp', '[]');
+----
+t_grp	false	0	0	0

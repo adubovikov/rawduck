@@ -1,0 +1,261 @@
+# name: test/sql/rawduck.test
+# description: RawDuck core: raw_type / raw_infer / raw_records over standard JSON types
+# group: [sql]
+
+# Before we load the extension, this will fail
+statement error
+SELECT raw_type('1');
+----
+Catalog Error
+
+require rawduck
+
+require json
+
+#===----------------------------------------------------------------------===#
+# raw_type: concrete type of a JSON value (RawTree dynamicType equivalent)
+#===----------------------------------------------------------------------===#
+
+query I
+SELECT raw_type('null');
+----
+Null
+
+query I
+SELECT raw_type('true');
+----
+Bool
+
+query I
+SELECT raw_type('42');
+----
+Int64
+
+query I
+SELECT raw_type('-42');
+----
+Int64
+
+query I
+SELECT raw_type('18446744073709551615');
+----
+UInt64
+
+query I
+SELECT raw_type('4.5');
+----
+Double
+
+query I
+SELECT raw_type('"hello"');
+----
+String
+
+query I
+SELECT raw_type('[1,2,3]');
+----
+Array
+
+query I
+SELECT raw_type('{"a":1}');
+----
+Object
+
+# unparseable input is treated as a plain string value
+query I
+SELECT raw_type('not json');
+----
+String
+
+query I
+SELECT raw_type(NULL);
+----
+NULL
+
+#===----------------------------------------------------------------------===#
+# raw_infer: the DuckDB type RawDuck assigns to a JSON value
+#===----------------------------------------------------------------------===#
+
+query I
+SELECT raw_infer('true');
+----
+BOOLEAN
+
+query I
+SELECT raw_infer('42');
+----
+BIGINT
+
+query I
+SELECT raw_infer('4.5');
+----
+DOUBLE
+
+query I
+SELECT raw_infer('"hello"');
+----
+VARCHAR
+
+query I
+SELECT raw_infer('"2024-01-15"');
+----
+DATE
+
+query I
+SELECT raw_infer('"2024-01-15T10:30:00"');
+----
+TIMESTAMP
+
+query I
+SELECT raw_infer('[1,2,3]');
+----
+BIGINT[]
+
+query I
+SELECT raw_infer('[1,2.5]');
+----
+DOUBLE[]
+
+query I
+SELECT raw_infer('{"a":1,"b":{"c":"x"},"tags":["a"]}');
+----
+OBJECT(a BIGINT, b.c VARCHAR, tags VARCHAR[])
+
+# arrays of objects are kept as JSON
+query I
+SELECT raw_infer('[{"a":1}]');
+----
+JSON
+
+#===----------------------------------------------------------------------===#
+# raw_records: typed rows out of a JSON payload
+#===----------------------------------------------------------------------===#
+
+query II
+SELECT a, b FROM raw_records('[{"a":1,"b":"x"},{"a":2}]');
+----
+1	x
+2	NULL
+
+query II
+SELECT typeof(a), typeof(b) FROM raw_records('[{"a":1,"b":"x"}]');
+----
+BIGINT	VARCHAR
+
+# single object payload
+query I
+SELECT a FROM raw_records('{"a":1}');
+----
+1
+
+# NDJSON payload
+query II
+SELECT a, b FROM raw_records(e'{"a":1,"b":true}\n{"a":2,"b":false}');
+----
+1	true
+2	false
+
+# scalar rows map to a single "value" column
+query I
+SELECT value FROM raw_records('[1,2,3]');
+----
+1
+2
+3
+
+# nested objects are flattened into dotted columns
+query III
+SELECT "user.name", "user.address.city", n FROM raw_records('[{"user":{"name":"alice","address":{"city":"Rome"}},"n":1}]');
+----
+alice	Rome	1
+
+# numeric widening within a payload
+query I
+SELECT typeof(v) FROM raw_records('[{"v":1},{"v":2.5}]') LIMIT 1;
+----
+DOUBLE
+
+# incompatible scalars widen to VARCHAR
+query I
+SELECT typeof(v) FROM raw_records('[{"v":1},{"v":"x"}]') LIMIT 1;
+----
+VARCHAR
+
+query I
+SELECT v FROM raw_records('[{"v":1},{"v":"x"}]');
+----
+1
+x
+
+# object/scalar conflict degrades to JSON
+query I
+SELECT typeof(v) FROM raw_records('[{"v":{"a":1}},{"v":2}]') LIMIT 1;
+----
+JSON
+
+# arrays of objects stay JSON
+query II
+SELECT typeof(items), items FROM raw_records('[{"items":[{"x":1}]}]');
+----
+JSON	[{"x":1}]
+
+# integers out of BIGINT range degrade to DOUBLE
+query I
+SELECT typeof(v) FROM raw_records('[{"v":18446744073709551615}]');
+----
+DOUBLE
+
+# all-null columns default to VARCHAR
+query II
+SELECT typeof(x), x FROM raw_records('[{"x":null}]');
+----
+VARCHAR	NULL
+
+# empty objects are kept as JSON
+query II
+SELECT typeof(o), o FROM raw_records('[{"o":{}}]');
+----
+JSON	{}
+
+# temporal sniffing
+query II
+SELECT typeof(d), typeof(ts) FROM raw_records('[{"d":"2024-01-15","ts":"2024-01-15T10:30:00"}]');
+----
+DATE	TIMESTAMP
+
+# DATE widens to TIMESTAMP
+query II
+SELECT typeof(d), d FROM raw_records('[{"d":"2024-01-15"},{"d":"2024-01-15T10:30:00"}]') LIMIT 1;
+----
+TIMESTAMP	2024-01-15 00:00:00
+
+# nested lists
+query II
+SELECT typeof(m), m FROM raw_records('[{"m":[[1,2],[3]]}]');
+----
+BIGINT[][]	[[1, 2], [3]]
+
+# empty payload yields zero rows
+query I
+SELECT count(*) FROM raw_records('[]');
+----
+0
+
+#===----------------------------------------------------------------------===#
+# error handling
+#===----------------------------------------------------------------------===#
+
+statement error
+SELECT * FROM raw_records('{invalid');
+----
+<REGEX>:.*not valid JSON.*
+
+statement error
+SELECT * FROM raw_records('[{"a":1}, 2]');
+----
+<REGEX>:.*mixes JSON objects.*
+
+statement error
+SELECT * FROM raw_records(NULL);
+----
+<REGEX>:.*payload may not be NULL.*

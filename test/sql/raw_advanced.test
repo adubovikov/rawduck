@@ -1,0 +1,119 @@
+# name: test/sql/raw_advanced.test
+# description: RawDuck streaming file ingestion and adaptive ORDER BY optimization
+# group: [sql]
+
+require rawduck
+
+require json
+
+#===----------------------------------------------------------------------===#
+# raw_ingest_file: streaming NDJSON ingestion
+#===----------------------------------------------------------------------===#
+
+statement ok
+COPY (SELECT 1 AS id, 'click' AS action UNION ALL SELECT 2, 'view') TO '__TEST_DIR__/events.ndjson' (FORMAT json);
+
+query IIIIII
+SELECT * FROM raw_ingest_file('t_file', '__TEST_DIR__/events.ndjson');
+----
+t_file	true	2	0	2	1
+
+query II
+SELECT id, action FROM t_file ORDER BY id;
+----
+1	click
+2	view
+
+# small batches: schema evolution across batch boundaries
+statement ok
+COPY (SELECT range AS n FROM range(10)) TO '__TEST_DIR__/r.ndjson' (FORMAT json);
+
+query II
+SELECT rows, batches FROM raw_ingest_file('t_batches', '__TEST_DIR__/r.ndjson', batch_size := 3);
+----
+10	4
+
+query II
+SELECT count(*), sum(n) FROM t_batches;
+----
+10	45
+
+# gzip-compressed input is auto-detected
+statement ok
+COPY (SELECT 7 AS z) TO '__TEST_DIR__/z.ndjson.gz' (FORMAT json, COMPRESSION gzip);
+
+query I
+SELECT rows FROM raw_ingest_file('t_gz', '__TEST_DIR__/z.ndjson.gz');
+----
+1
+
+query I
+SELECT z FROM t_gz;
+----
+7
+
+statement error
+SELECT * FROM raw_ingest_file('t_x', '__TEST_DIR__/does_not_exist.ndjson');
+----
+<REGEX>:.*does_not_exist.*
+
+statement error
+SELECT * FROM raw_ingest_file('t_x', '__TEST_DIR__/events.ndjson', batch_size := 0);
+----
+<REGEX>:.*batch_size must be positive.*
+
+#===----------------------------------------------------------------------===#
+# raw_stats / raw_optimize: adaptive ORDER BY from observed predicates
+#===----------------------------------------------------------------------===#
+
+statement ok
+SELECT * FROM raw_ingest('t_opt', '[{"k":"a","v":1},{"k":"b","v":2},{"k":"a","v":3}]');
+
+# observe some pushed-down predicates: k is filtered more often than v
+statement ok
+SELECT count(*) FROM t_opt WHERE k = 'a';
+
+statement ok
+SELECT count(*) FROM t_opt WHERE k = 'b';
+
+statement ok
+SELECT count(*) FROM t_opt WHERE v > 1;
+
+query III
+SELECT "table", "column", filter_count >= 1 FROM raw_stats() WHERE "table" = 'memory.main.t_opt' ORDER BY "column";
+----
+memory.main.t_opt	k	true
+memory.main.t_opt	v	true
+
+# physically reorder by the hottest predicate columns
+query III
+SELECT "table", order_by, rows FROM raw_optimize('t_opt');
+----
+t_opt	"k", "v"	3
+
+# data survives and is now physically ordered by k, v
+query II
+SELECT k, v FROM t_opt;
+----
+a	1
+a	3
+b	2
+
+query I
+SELECT count(*) FROM t_opt WHERE k = 'a';
+----
+2
+
+# optimizing a table without observed predicates is a no-op
+statement ok
+SELECT * FROM raw_ingest('t_nostats', '[{"x":1}]');
+
+query III
+SELECT "table", order_by IS NULL, rows FROM raw_optimize('t_nostats');
+----
+t_nostats	true	0
+
+query I
+SELECT x FROM t_nostats;
+----
+1
