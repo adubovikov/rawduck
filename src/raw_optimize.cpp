@@ -48,6 +48,13 @@ public:
 	map<string, map<string, idx_t>> group_sets;
 	// fully qualified table key -> materialized projection table name
 	map<string, pair<string, string>> projections;
+
+	struct OptimizeState {
+		string order_by;
+		idx_t row_count = 0;
+	};
+	// fully qualified table key -> last raw_optimize outcome
+	map<string, OptimizeState> optimized;
 };
 
 static RawStatsCache &GetStatsCache(ClientContext &context) {
@@ -255,8 +262,8 @@ static unique_ptr<FunctionData> RawOptimizeBind(ClientContext &context, TableFun
 		throw InvalidInputException("RawDuck: raw_optimize(table) argument may not be NULL");
 	}
 	result->target = input.inputs[0].GetValue<string>();
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT};
-	names = {"table", "order_by", "rows"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::VARCHAR};
+	names = {"table", "order_by", "rows", "mode"};
 	return std::move(result);
 }
 
@@ -301,6 +308,7 @@ static void RawOptimizeFunction(ClientContext &context, TableFunctionInput &data
 		// nothing observed yet: no-op
 		output.SetValue(1, 0, Value(LogicalType::VARCHAR));
 		output.SetValue(2, 0, Value::BIGINT(0));
+		output.SetValue(3, 0, Value("noop"));
 		output.SetCardinality(1);
 		return;
 	}
@@ -310,7 +318,7 @@ static void RawOptimizeFunction(ClientContext &context, TableFunctionInput &data
 		order_by += (i ? ", " : "") + RawQuoteIdentifier(ranked[i].first);
 	}
 
-	// rewrite the table physically ordered by the hottest predicate columns
+	auto table_key = TableKey(table);
 	auto catalog = table.ParentCatalog().GetName();
 	auto schema = table.ParentSchema().name;
 	auto table_name = table.name;
@@ -327,22 +335,74 @@ static void RawOptimizeFunction(ClientContext &context, TableFunctionInput &data
 		}
 		return result;
 	};
+
+	// decide between a full rewrite and an incremental tail sort: if the
+	// table only grew since the last optimize with the same key, the sorted
+	// prefix can stay in place and only the new rows form a new sorted run
+	// (zone maps prune per row group, RawMergeTree-parts style)
+	idx_t last_count = 0;
+	{
+		auto &stats = GetStatsCache(context);
+		lock_guard<mutex> guard(stats.lock);
+		auto entry = stats.optimized.find(table_key);
+		if (entry != stats.optimized.end() && entry->second.order_by == order_by) {
+			last_count = entry->second.row_count;
+		}
+	}
+	auto shape = run("SELECT count(*), coalesce(max(rowid) + 1, 0) FROM " + qualified);
+	auto current_count = NumericCast<idx_t>(shape->GetValue(0, 0).GetValue<int64_t>());
+	auto rowid_end = NumericCast<idx_t>(shape->GetValue(1, 0).GetValue<int64_t>());
+	// rowid continuity proves the table is append-only since the last rewrite
+	bool append_only = current_count == rowid_end;
+
+	string mode;
 	int64_t rows = 0;
-	run("BEGIN TRANSACTION");
-	try {
-		auto created =
-		    run("CREATE TABLE " + tmp_qualified + " AS SELECT * FROM " + qualified + " ORDER BY " + order_by);
-		rows = created->GetValue(0, 0).GetValue<int64_t>();
-		run("DROP TABLE " + qualified);
-		run("ALTER TABLE " + tmp_qualified + " RENAME TO " + RawQuoteIdentifier(table_name));
-		run("COMMIT");
-	} catch (...) {
-		conn.Query("ROLLBACK");
-		throw;
+	if (last_count > 0 && append_only && current_count == last_count) {
+		mode = "noop";
+	} else if (last_count > 0 && append_only && current_count > last_count) {
+		mode = "incremental";
+		run("BEGIN TRANSACTION");
+		try {
+			auto tail = to_string(last_count);
+			run("CREATE TEMPORARY TABLE __rawduck_optimize_tail AS SELECT * FROM " + qualified +
+			    " WHERE rowid >= " + tail);
+			run("DELETE FROM " + qualified + " WHERE rowid >= " + tail);
+			auto inserted =
+			    run("INSERT INTO " + qualified + " SELECT * FROM __rawduck_optimize_tail ORDER BY " + order_by);
+			rows = inserted->GetValue(0, 0).GetValue<int64_t>();
+			run("DROP TABLE __rawduck_optimize_tail");
+			run("COMMIT");
+		} catch (...) {
+			conn.Query("ROLLBACK");
+			throw;
+		}
+	} else {
+		mode = "full";
+		run("BEGIN TRANSACTION");
+		try {
+			auto created =
+			    run("CREATE TABLE " + tmp_qualified + " AS SELECT * FROM " + qualified + " ORDER BY " + order_by);
+			rows = created->GetValue(0, 0).GetValue<int64_t>();
+			run("DROP TABLE " + qualified);
+			run("ALTER TABLE " + tmp_qualified + " RENAME TO " + RawQuoteIdentifier(table_name));
+			run("COMMIT");
+		} catch (...) {
+			conn.Query("ROLLBACK");
+			throw;
+		}
+	}
+	{
+		auto &stats = GetStatsCache(context);
+		lock_guard<mutex> guard(stats.lock);
+		RawStatsCache::OptimizeState optimize_state;
+		optimize_state.order_by = order_by;
+		optimize_state.row_count = current_count;
+		stats.optimized[table_key] = optimize_state;
 	}
 
 	output.SetValue(1, 0, Value(order_by));
 	output.SetValue(2, 0, Value::BIGINT(rows));
+	output.SetValue(3, 0, Value(mode));
 	output.SetCardinality(1);
 }
 
@@ -480,7 +540,7 @@ static void RawProjectFunction(ClientContext &context, TableFunctionInput &data,
 	}
 	output.SetValue(1, 0, Value(projection_name));
 	output.SetValue(2, 0, Value(group_set));
-	output.SetValue(3, 0, Value::BIGINT(projection_rows));
+	output.SetValue(3, 0, Value(projection_rows));
 	output.SetCardinality(1);
 }
 

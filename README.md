@@ -81,7 +81,7 @@ WHERE type = 'PushEvent' GROUP BY 1 ORDER BY pushes DESC LIMIT 10;           -- 
 | `raw_ingest_file(table, path, batch_size := 30000)` | table | Streaming ingest of NDJSON files (gzip auto-detected, any DuckDB filesystem) in bounded-memory batches, evolving the schema between batches. The whole file is one atomic operation. |
 | `raw_records(payload)` | table | Parse + infer + flatten a JSON payload into typed rows without touching any table. |
 | `raw_stats()` | table | Observed usage statistics per column: pushed-down filters and GROUP BY keys, collected automatically by an optimizer hook. |
-| `raw_optimize(table)` | table | RawMergeTree-style adaptive layout: physically reorders the table by its hottest columns (filters weighted over groupings, from `raw_stats`). |
+| `raw_optimize(table)` | table | RawMergeTree-style adaptive layout: physically reorders the table by its hottest columns. Incremental: append-only growth since the last optimize sorts only the new tail into a fresh sorted run (`mode` = `full` / `incremental` / `noop`). |
 | `raw_transforms()` / `raw_transform_define(name, path)` | table / scalar | List and register ingest-time transforms; definitions compose with `read_json`, tables, or any query. |
 | `raw_projections()` | table | The projection advisor: GROUP BY shapes queries actually run, with observation counts and materialization status. |
 | `raw_project(table)` | table | RawMergeTree auto-projections: materializes the hottest observed aggregation as a lightweight `<table>__proj` summary table. |
@@ -217,7 +217,6 @@ predicate statistics + adaptive reordering, and DuckLake catalogs (`test/sql/duc
 
 ## Roadmap
 
-- incremental `raw_optimize` (reorder only new row groups, RawMergeTree merge-style)
 - persisted statistics and projection registry inside RawDuck stores
 - automatic aggregate rewriting onto materialized projections
 

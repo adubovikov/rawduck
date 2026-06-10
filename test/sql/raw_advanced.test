@@ -86,10 +86,10 @@ memory.main.t_opt	k	true	0
 memory.main.t_opt	v	true	0
 
 # physically reorder by the hottest predicate columns
-query III
-SELECT "table", order_by, rows FROM raw_optimize('t_opt');
+query IIII
+SELECT "table", order_by, rows, mode FROM raw_optimize('t_opt');
 ----
-t_opt	"k", "v"	3
+t_opt	"k", "v"	3	full
 
 # data survives and is now physically ordered by k, v
 query II
@@ -108,10 +108,10 @@ SELECT count(*) FROM t_opt WHERE k = 'a';
 statement ok
 SELECT * FROM raw_ingest('t_nostats', '[{"x":1}]');
 
-query III
-SELECT "table", order_by IS NULL, rows FROM raw_optimize('t_nostats');
+query IIII
+SELECT "table", order_by IS NULL, rows, mode FROM raw_optimize('t_nostats');
 ----
-t_nostats	true	0
+t_nostats	true	0	noop
 
 query I
 SELECT x FROM t_nostats;
@@ -292,3 +292,22 @@ query II
 SELECT projection IS NULL, rows FROM raw_project('t_noproj');
 ----
 true	0
+
+# incremental optimize: appended rows form a new sorted run; unchanged is a no-op
+query I
+SELECT mode FROM raw_optimize('t_opt');
+----
+noop
+
+statement ok
+SELECT * FROM raw_ingest('t_opt', '[{"k":"c","v":9},{"k":"a","v":0}]');
+
+query II
+SELECT rows, mode FROM raw_optimize('t_opt');
+----
+2	incremental
+
+query II
+SELECT count(*), min(v) FROM t_opt WHERE k = 'a';
+----
+3	0
