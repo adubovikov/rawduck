@@ -22,6 +22,10 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/optimistic_data_writer.hpp"
+#include "duckdb/storage/table/append_state.hpp"
+#include "duckdb/storage/table/row_group_collection.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
 #include <condition_variable>
@@ -144,6 +148,200 @@ static unique_ptr<MaterializedQueryResult> RunQuery(Connection &conn, const stri
 }
 
 //===--------------------------------------------------------------------===//
+// RawAppendPool: multi-threaded appends
+//
+// Worker threads extract payload batches into private optimistic row-group
+// collections (the same mechanism as DuckDB's parallel INSERT sink); the
+// collections merge into transaction-local storage on the main thread when
+// the pool drains. The pool must drain before any DDL, so the table schema
+// is frozen for its lifetime.
+//===--------------------------------------------------------------------===//
+
+class RawAppendPool {
+public:
+	RawAppendPool(ClientContext &context, TableCatalogEntry &table, idx_t worker_count)
+	    : context(context), table(table), storage(table.GetStorage()), types(table.GetTypes()) {
+		idx_t physical_index = 0;
+		for (auto &column : table.GetColumns().Physical()) {
+			slots[column.Name()] = physical_index++;
+		}
+		workers = vector<Worker>(worker_count);
+		for (auto &worker : workers) {
+			worker.writer = make_uniq<OptimisticDataWriter>(context, storage);
+			auto collection = worker.writer->CreateCollection(storage, types);
+			collection->collection->InitializeEmpty();
+			collection->collection->InitializeAppend(worker.append_state);
+			auto index = storage.CreateOptimisticCollection(context, std::move(collection));
+			worker.collection = &storage.GetOptimisticCollection(context, index);
+		}
+		for (idx_t i = 0; i < worker_count; i++) {
+			threads.emplace_back([this, i] { WorkerLoop(workers[i]); });
+		}
+	}
+	~RawAppendPool() {
+		// abnormal teardown: stop workers, merge nothing
+		Stop();
+	}
+
+	void Submit(shared_ptr<RawParsedPayload> parsed) {
+		std::unique_lock<mutex> guard(lock);
+		producer_cv.wait(guard, [&] { return queue.size() < 4 || stopped; });
+		if (stopped) {
+			return;
+		}
+		queue.push_back(std::move(parsed));
+		worker_cv.notify_one();
+	}
+
+	// stops the workers and merges their collections; returns appended rows
+	idx_t Drain() {
+		Stop();
+		if (error) {
+			std::rethrow_exception(error);
+		}
+		idx_t total = 0;
+		vector<unique_ptr<BoundConstraint>> no_constraints;
+		for (auto &worker : workers) {
+			auto &collection = *worker.collection->collection;
+			collection.FinalizeAppend(TransactionData(0, 0), worker.append_state);
+			auto count = collection.GetTotalRows();
+			if (count == 0) {
+				continue;
+			}
+			total += count;
+			if (count < storage.GetRowGroupSize()) {
+				// few rows: append them to local storage directly
+				LocalAppendState append_state;
+				storage.InitializeLocalAppend(append_state, table, context, no_constraints);
+				auto &transaction = DuckTransaction::Get(context, table.catalog);
+				for (auto &chunk : collection.Chunks(transaction)) {
+					storage.LocalAppend(append_state, context, chunk, false);
+				}
+				storage.FinalizeLocalAppend(append_state);
+			} else {
+				// row groups were written optimistically: merge them in place
+				worker.writer->WriteUnflushedRowGroups(*worker.collection);
+				worker.writer->FinalFlush();
+				storage.LocalMerge(context, *worker.collection);
+				storage.GetOptimisticWriter(context).Merge(*worker.writer);
+			}
+		}
+		workers.clear();
+		return total;
+	}
+
+private:
+	struct Worker {
+		unique_ptr<OptimisticDataWriter> writer;
+		optional_ptr<OptimisticWriteCollection> collection;
+		TableAppendState append_state;
+	};
+
+	void Stop() {
+		{
+			std::unique_lock<mutex> guard(lock);
+			stopped = true;
+			worker_cv.notify_all();
+			producer_cv.notify_all();
+		}
+		for (auto &thread : threads) {
+			thread.join();
+		}
+		threads.clear();
+	}
+
+	void WorkerLoop(Worker &worker) {
+		try {
+			DataChunk chunk;
+			chunk.Initialize(Allocator::Get(context), types);
+			while (true) {
+				shared_ptr<RawParsedPayload> parsed;
+				{
+					std::unique_lock<mutex> guard(lock);
+					worker_cv.wait(guard, [&] { return !queue.empty() || stopped; });
+					if (queue.empty()) {
+						return;
+					}
+					parsed = std::move(queue.front());
+					queue.pop_front();
+					producer_cv.notify_one();
+				}
+				AppendBatch(worker, *parsed, chunk);
+			}
+		} catch (...) {
+			std::unique_lock<mutex> guard(lock);
+			if (!error) {
+				error = std::current_exception();
+			}
+			stopped = true;
+			worker_cv.notify_all();
+			producer_cv.notify_all();
+		}
+	}
+
+	void AppendBatch(Worker &worker, RawParsedPayload &parsed, DataChunk &chunk) {
+		RawExtractor extractor(*parsed.root, parsed.columns);
+		vector<idx_t> slot_of(parsed.columns.size());
+		vector<bool> covered(types.size(), false);
+		for (idx_t col = 0; col < parsed.columns.size(); col++) {
+			auto entry = slots.find(parsed.columns[col].name);
+			if (entry == slots.end()) {
+				throw InternalException("RawDuck: column %s missing from append pool schema", parsed.columns[col].name);
+			}
+			slot_of[col] = entry->second;
+			covered[entry->second] = true;
+		}
+		auto &payload_rows = parsed.payload.rows;
+		for (idx_t start = 0; start < payload_rows.size(); start += STANDARD_VECTOR_SIZE) {
+			auto count = MinValue<idx_t>(payload_rows.size() - start, STANDARD_VECTOR_SIZE);
+			chunk.Reset();
+			extractor.Reset(count);
+			for (idx_t i = 0; i < count; i++) {
+				extractor.AssignRow(payload_rows[start + i], i);
+			}
+			for (idx_t col = 0; col < parsed.columns.size(); col++) {
+				auto slot = slot_of[col];
+				if (RawFillSupported(types[slot])) {
+					FillVector(extractor.ColumnValues(col), types[slot], chunk.data[slot], 0);
+				} else {
+					Vector source(parsed.columns[col].type, count);
+					FillVector(extractor.ColumnValues(col), parsed.columns[col].type, source, 0);
+					VectorOperations::DefaultCast(source, chunk.data[slot], count);
+				}
+			}
+			for (idx_t slot = 0; slot < types.size(); slot++) {
+				if (!covered[slot]) {
+					chunk.data[slot].SetVectorType(VectorType::CONSTANT_VECTOR);
+					ConstantVector::SetNull(chunk.data[slot], true);
+				}
+			}
+			chunk.SetCardinality(count);
+			if (collection_of(worker).Append(chunk, worker.append_state)) {
+				worker.writer->WriteNewRowGroup(*worker.collection);
+			}
+		}
+	}
+
+	static RowGroupCollection &collection_of(Worker &worker) {
+		return *worker.collection->collection;
+	}
+
+	ClientContext &context;
+	TableCatalogEntry &table;
+	DataTable &storage;
+	vector<LogicalType> types;
+	case_insensitive_map_t<idx_t> slots;
+	vector<Worker> workers;
+	vector<std::thread> threads;
+	mutex lock;
+	std::condition_variable worker_cv;
+	std::condition_variable producer_cv;
+	std::deque<shared_ptr<RawParsedPayload>> queue;
+	bool stopped = false;
+	std::exception_ptr error;
+};
+
+//===--------------------------------------------------------------------===//
 // RawIngestor: schema evolution + append for one target table
 //===--------------------------------------------------------------------===//
 
@@ -176,20 +374,25 @@ public:
 
 	void Ingest(const string &payload_str) {
 		auto parsed = RawParsedPayload::Process(payload_str, options);
-		IngestParsed(*parsed, payload_str);
+		IngestParsed(std::move(parsed), payload_str);
 	}
 
-	void IngestParsed(RawParsedPayload &parsed, const string &payload_str) {
-		errors += parsed.payload.parse_errors;
+	void IngestParsed(shared_ptr<RawParsedPayload> parsed, const string &payload_str) {
+		errors += parsed->payload.parse_errors;
 		if (native) {
-			IngestNative(parsed);
+			IngestNative(std::move(parsed));
 		} else {
-			IngestFallback(parsed, payload_str);
+			IngestFallback(*parsed, payload_str);
 		}
 	}
 
-	const RawParseOptions &Options() const {
-		return options;
+	// merges any outstanding parallel appends; must be called before the
+	// ingestion result is read
+	void Finish() {
+		if (pool) {
+			rows += pool->Drain();
+			pool.reset();
+		}
 	}
 
 	bool created = false;
@@ -208,7 +411,38 @@ private:
 		                                            OnEntryNotFound::RETURN_NULL);
 	}
 
-	void IngestNative(RawParsedPayload &parsed) {
+	// whether evolution would need DDL for this payload
+	bool NeedsDDL(TableCatalogEntry &table, RawParsedPayload &parsed) {
+		auto &existing_columns = table.GetColumns();
+		for (auto &column : parsed.columns) {
+			if (!existing_columns.ColumnExists(column.name)) {
+				return true;
+			}
+			auto &existing = existing_columns.GetColumn(column.name);
+			if (JoinColumnTypes(existing.Type(), column.type) != existing.Type()) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	bool PoolEligible(TableCatalogEntry &table, RawParsedPayload &parsed) {
+		if (parsed.payload.rows.size() < 4096) {
+			return false;
+		}
+		auto &columns_list = table.GetColumns();
+		if (columns_list.PhysicalColumnCount() != columns_list.LogicalColumnCount()) {
+			return false;
+		}
+		if (table.GetStorage().HasIndexes()) {
+			return false;
+		}
+		auto binder = Binder::CreateBinder(context);
+		return binder->BindConstraints(table).empty();
+	}
+
+	void IngestNative(shared_ptr<RawParsedPayload> parsed_ptr) {
+		auto &parsed = *parsed_ptr;
 		auto table = LookupTable();
 		if (!table && parsed.columns.empty()) {
 			throw InvalidInputException("RawDuck: cannot create table %s from an empty payload", target);
@@ -227,6 +461,11 @@ private:
 			created = true;
 			columns_added += parsed.columns.size();
 		} else {
+			if (pool && NeedsDDL(*table, parsed)) {
+				// the pool's schema is frozen: merge its work before altering
+				rows += pool->Drain();
+				pool.reset();
+			}
 			EvolveNative(catalog, *table, parsed);
 		}
 		if (parsed.payload.rows.empty()) {
@@ -236,6 +475,14 @@ private:
 		table = LookupTable();
 		if (!table) {
 			throw InternalException("RawDuck: table %s disappeared during ingestion", target);
+		}
+		if (!pool && PoolEligible(*table, parsed)) {
+			auto worker_count = MaxValue<idx_t>(1, MinValue<idx_t>(std::thread::hardware_concurrency() / 2, 4));
+			pool = make_uniq<RawAppendPool>(context, *table, worker_count);
+		}
+		if (pool) {
+			pool->Submit(std::move(parsed_ptr));
+			return;
 		}
 		AppendNative(*table, parsed);
 	}
@@ -495,6 +742,7 @@ private:
 	RawParseOptions options;
 	QualifiedName qname;
 	bool native = false;
+	unique_ptr<RawAppendPool> pool;
 	// fallback state
 	unique_ptr<Connection> fallback_conn;
 	bool fallback_exists = false;
@@ -562,6 +810,7 @@ static void RawIngestFunction(ClientContext &context, TableFunctionInput &data, 
 
 	RawIngestor ingestor(context, bind_data.target, bind_data.options);
 	ingestor.Ingest(bind_data.payload);
+	ingestor.Finish();
 	EmitIngestRow(output, bind_data.target, ingestor);
 }
 
@@ -720,7 +969,7 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 	try {
 		RawIngestPipeline::Item item;
 		while (pipeline.Pop(item)) {
-			ingestor.IngestParsed(*item.parsed, item.payload);
+			ingestor.IngestParsed(std::move(item.parsed), item.payload);
 			batches++;
 		}
 	} catch (...) {
@@ -732,6 +981,7 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 	if (pipeline.error) {
 		std::rethrow_exception(pipeline.error);
 	}
+	ingestor.Finish();
 
 	EmitIngestRow(output, bind_data.target, ingestor);
 	output.SetValue(6, 0, Value::BIGINT(NumericCast<int64_t>(batches)));

@@ -213,3 +213,34 @@ statement error
 SELECT raw_transform_define('cloudwatch-logs', 'x');
 ----
 <REGEX>:.*built-in transform.*
+
+#===----------------------------------------------------------------------===#
+# multi-threaded appends (pool engages above 4096 rows per batch)
+#===----------------------------------------------------------------------===#
+
+statement ok
+COPY (SELECT range AS n, 'v' || (range % 7) AS v FROM range(20000)) TO '__TEST_DIR__/big.ndjson' (FORMAT json);
+
+query II
+SELECT rows, errors FROM raw_ingest_file('t_mt', '__TEST_DIR__/big.ndjson', batch_size := 6000);
+----
+20000	0
+
+query III
+SELECT count(*), count(DISTINCT n), sum(n) FROM t_mt;
+----
+20000	20000	199990000
+
+# schema evolution drains the pool correctly mid-stream
+statement ok
+COPY (SELECT range AS n, range * 1.5 AS extra FROM range(5000)) TO '__TEST_DIR__/big2.ndjson' (FORMAT json);
+
+query I
+SELECT rows FROM raw_ingest_file('t_mt', '__TEST_DIR__/big2.ndjson');
+----
+5000
+
+query III
+SELECT count(*), count(extra), max(extra) FROM t_mt;
+----
+25000	5000	7498.5
