@@ -141,7 +141,9 @@ private:
 				guard.lock();
 			}
 		}
-		// drain on shutdown, best effort
+		// best-effort drain; at database teardown the weak reference is
+		// already expired, so unflushed buffers are dropped (documented:
+		// call raw_flush() before closing)
 		auto remaining = std::move(buffers);
 		guard.unlock();
 		for (auto &entry : remaining) {

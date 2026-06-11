@@ -106,7 +106,10 @@ For high-rate clients, ClickHouse-style **asynchronous inserts** are available a
 background flusher coalesces per-table buffers and ingests them in one transaction when a buffer
 exceeds `rawduck_async_max_data_size` (default 1 MB) or its oldest entry exceeds
 `rawduck_async_busy_timeout_ms` (default 200 ms). `raw_flush()` drains synchronously. Semantics
-match fire-and-forget async inserts: a failed background flush drops that batch.
+match fire-and-forget async inserts: enqueued payloads commit in the flusher's own transactions
+(outside the caller's), a failed background flush drops that batch, and buffers still inside the
+timeout window when the database closes are dropped — call `raw_flush()` before closing. The HTTP
+and gRPC endpoints always ingest synchronously (each request is its own transaction).
 
 ## HTTP API
 

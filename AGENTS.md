@@ -27,6 +27,7 @@ release`; test with `./build/release/test/unittest --test-dir . "test/sql/*"`; f
 | `raw_transforms.cpp` | User-defined transform registry, `raw_transform_define()` scalar, `raw_transforms()`. |
 | `raw_attach.cpp` | `ATTACH 'rawduck:...'` storage extension (`RawDuckCatalog : DuckCatalog`). |
 | `raw_scalars.cpp` | `raw_type()`, `raw_infer()`. |
+| `raw_async.cpp` | Opt-in async inserts: per-table buffers + background flusher owned by an `ObjectCache` entry (joins on teardown; `weak_ptr` database guard; fire-and-forget semantics — `raw_flush()` is the synchronous drain). |
 | `raw_api.cpp` | `raw_serve()` / `raw_serve_stop()`: in-process HTTP API on DuckDB's vendored `duckdb_httplib`. |
 
 ## Design invariants — do not break these
