@@ -53,6 +53,9 @@ struct RawParseOptions {
 	// ingest-time transform: explode the array at this dotted path into one
 	// row per element, merging the envelope fields into each row
 	vector<string> explode_path;
+	// apply OTLP semantics after exploding: spread KeyValue attribute lists
+	// into their parent, unwrap AnyValue, numeric *UnixNano fields
+	bool otlp = false;
 };
 
 // A parsed payload: one or more JSON documents and the row roots within them.
@@ -63,6 +66,8 @@ struct RawPayload {
 	bool scalar_rows = false;
 	// NDJSON lines skipped because they failed to parse (ignore_errors only)
 	idx_t parse_errors = 0;
+	// apply OTLP semantic normalization during Explode
+	bool otlp_semantics = false;
 
 	RawPayload() = default;
 	RawPayload(const RawPayload &) = delete;
@@ -97,6 +102,7 @@ void RawPayloadFinalize(RawParsedPayload &payload, const RawParseOptions &option
 // register additional ones via raw_transform_define().
 const vector<pair<string, string>> &RawBuiltinTransforms();
 bool ResolveBuiltinTransform(const string &name, string &path);
+bool RawTransformIsOtlp(const string &name);
 RawParseOptions RawExplodeOptions(const string &path);
 
 RawScalarKind JoinScalarKinds(RawScalarKind a, RawScalarKind b);

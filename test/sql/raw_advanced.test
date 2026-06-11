@@ -421,3 +421,11 @@ SELECT count(*), count(b) FROM t_async;
 
 statement ok
 SET rawduck_async_insert = false;
+
+# OTLP semantic normalization: KeyValue attributes spread into flat columns,
+# AnyValue unwraps, *UnixNano digit-strings become integers
+query IIIIII
+SELECT body, pod, status, "resource.service.name", "timeUnixNano", typeof("timeUnixNano")
+FROM raw_records('{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"api"}}]},"scopeLogs":[{"scope":{"name":"http"},"logRecords":[{"timeUnixNano":"1718000000000000000","body":{"stringValue":"request ok"},"attributes":[{"key":"pod","value":{"stringValue":"pod-a"}},{"key":"status","value":{"intValue":"200"}}]}]}]}]}', transform := 'otlp-logs');
+----
+request ok	pod-a	200	api	1718000000000000000	BIGINT

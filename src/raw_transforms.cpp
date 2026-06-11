@@ -44,6 +44,7 @@ RawParseOptions ResolveTransform(ClientContext &context, const string &transform
 		throw InvalidInputException("RawDuck: specify either transform or explode, not both");
 	}
 	string path = explode;
+	bool otlp = !transform.empty() && RawTransformIsOtlp(transform);
 	if (!transform.empty() && !ResolveBuiltinTransform(transform, path)) {
 		auto &registry = GetTransformRegistry(context);
 		lock_guard<mutex> guard(registry.lock);
@@ -56,7 +57,9 @@ RawParseOptions ResolveTransform(ClientContext &context, const string &transform
 		}
 		path = entry->second;
 	}
-	return RawExplodeOptions(path);
+	auto options = RawExplodeOptions(path);
+	options.otlp = otlp;
+	return options;
 }
 
 //===--------------------------------------------------------------------===//

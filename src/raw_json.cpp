@@ -3,6 +3,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/types/value.hpp"
 
 #include <cstdlib>
@@ -101,6 +102,7 @@ void RawPayload::Parse(const string &payload, const RawParseOptions &options) {
 	}
 	CheckRowUniformity(rows, scalar_rows);
 	if (!options.explode_path.empty()) {
+		otlp_semantics = options.otlp;
 		Explode(options.explode_path);
 	}
 }
@@ -183,6 +185,157 @@ static void ExplodeInto(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjson::yyjso
 	envelopes.pop_back();
 }
 
+//===--------------------------------------------------------------------===//
+// OTLP semantic normalization (applied per exploded row when options.otlp):
+// - KeyValue arrays under an "attributes" member spread into the parent
+//   object as real fields (existing fields win on collision)
+// - AnyValue wrappers unwrap: {"stringValue": s} -> s, {"intValue": "1"} -> 1,
+//   arrayValue/kvlistValue recurse
+// - all-digit *UnixNano strings become integers
+//===--------------------------------------------------------------------===//
+
+static duckdb_yyjson::yyjson_mut_val *OtlpNormalizeValue(duckdb_yyjson::yyjson_mut_doc *doc,
+                                                         duckdb_yyjson::yyjson_mut_val *value, const char *key,
+                                                         size_t key_len);
+
+static bool OtlpIsKeyValueArray(duckdb_yyjson::yyjson_mut_val *value) {
+	if (!duckdb_yyjson::yyjson_mut_is_arr(value) || duckdb_yyjson::yyjson_mut_arr_size(value) == 0) {
+		return false;
+	}
+	duckdb_yyjson::yyjson_mut_arr_iter iter;
+	duckdb_yyjson::yyjson_mut_arr_iter_init(value, &iter);
+	while (auto element = duckdb_yyjson::yyjson_mut_arr_iter_next(&iter)) {
+		if (!duckdb_yyjson::yyjson_mut_is_obj(element) || !duckdb_yyjson::yyjson_mut_obj_get(element, "key")) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// {"stringValue": ...} / {"intValue": "123"} / {"arrayValue": {"values": [..]}} ...
+static duckdb_yyjson::yyjson_mut_val *OtlpUnwrapAnyValue(duckdb_yyjson::yyjson_mut_doc *doc,
+                                                         duckdb_yyjson::yyjson_mut_val *value) {
+	if (!duckdb_yyjson::yyjson_mut_is_obj(value) || duckdb_yyjson::yyjson_mut_obj_size(value) != 1) {
+		return nullptr;
+	}
+	duckdb_yyjson::yyjson_mut_obj_iter iter;
+	duckdb_yyjson::yyjson_mut_obj_iter_init(value, &iter);
+	auto key = duckdb_yyjson::yyjson_mut_obj_iter_next(&iter);
+	auto inner = duckdb_yyjson::yyjson_mut_obj_iter_get_val(key);
+	string name(duckdb_yyjson::yyjson_mut_get_str(key), duckdb_yyjson::yyjson_mut_get_len(key));
+	if (name == "stringValue" || name == "boolValue" || name == "doubleValue" || name == "bytesValue") {
+		return inner;
+	}
+	if (name == "intValue") {
+		if (duckdb_yyjson::yyjson_mut_is_str(inner)) {
+			auto str = duckdb_yyjson::yyjson_mut_get_str(inner);
+			int64_t parsed;
+			if (TryCast::Operation<string_t, int64_t>(string_t(str, duckdb_yyjson::yyjson_mut_get_len(inner)),
+			                                          parsed)) {
+				return duckdb_yyjson::yyjson_mut_sint(doc, parsed);
+			}
+		}
+		return inner;
+	}
+	if (name == "arrayValue" || name == "kvlistValue") {
+		auto values =
+		    duckdb_yyjson::yyjson_mut_is_obj(inner) ? duckdb_yyjson::yyjson_mut_obj_get(inner, "values") : nullptr;
+		if (!values) {
+			return nullptr;
+		}
+		return OtlpNormalizeValue(doc, values, name == "kvlistValue" ? "attributes" : "", 0);
+	}
+	return nullptr;
+}
+
+static void OtlpNormalizeObject(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjson::yyjson_mut_val *object) {
+	// rebuild members so attribute lists can spread into the parent
+	vector<pair<duckdb_yyjson::yyjson_mut_val *, duckdb_yyjson::yyjson_mut_val *>> members;
+	duckdb_yyjson::yyjson_mut_obj_iter iter;
+	duckdb_yyjson::yyjson_mut_obj_iter_init(object, &iter);
+	while (auto key = duckdb_yyjson::yyjson_mut_obj_iter_next(&iter)) {
+		members.emplace_back(key, duckdb_yyjson::yyjson_mut_obj_iter_get_val(key));
+	}
+	duckdb_yyjson::yyjson_mut_obj_clear(object);
+	for (auto &member : members) {
+		auto key_str = duckdb_yyjson::yyjson_mut_get_str(member.first);
+		auto key_len = duckdb_yyjson::yyjson_mut_get_len(member.first);
+		if (key_len == 10 && memcmp(key_str, "attributes", 10) == 0 && OtlpIsKeyValueArray(member.second)) {
+			// spread the KeyValue list into this object; real fields win
+			duckdb_yyjson::yyjson_mut_arr_iter elements;
+			duckdb_yyjson::yyjson_mut_arr_iter_init(member.second, &elements);
+			while (auto element = duckdb_yyjson::yyjson_mut_arr_iter_next(&elements)) {
+				auto name = duckdb_yyjson::yyjson_mut_obj_get(element, "key");
+				auto value = duckdb_yyjson::yyjson_mut_obj_get(element, "value");
+				if (!name || !duckdb_yyjson::yyjson_mut_is_str(name)) {
+					continue;
+				}
+				auto normalized = value ? OtlpNormalizeValue(doc, value, "", 0) : nullptr;
+				if (normalized && !duckdb_yyjson::yyjson_mut_obj_getn(object, duckdb_yyjson::yyjson_mut_get_str(name),
+				                                                      duckdb_yyjson::yyjson_mut_get_len(name))) {
+					duckdb_yyjson::yyjson_mut_obj_add(object, name, normalized);
+				}
+			}
+			continue;
+		}
+		auto normalized = OtlpNormalizeValue(doc, member.second, key_str, key_len);
+		if (!duckdb_yyjson::yyjson_mut_obj_getn(object, key_str, key_len)) {
+			duckdb_yyjson::yyjson_mut_obj_add(object, member.first, normalized ? normalized : member.second);
+		}
+	}
+}
+
+static duckdb_yyjson::yyjson_mut_val *OtlpNormalizeValue(duckdb_yyjson::yyjson_mut_doc *doc,
+                                                         duckdb_yyjson::yyjson_mut_val *value, const char *key,
+                                                         size_t key_len) {
+	if (duckdb_yyjson::yyjson_mut_is_obj(value)) {
+		auto unwrapped = OtlpUnwrapAnyValue(doc, value);
+		if (unwrapped) {
+			return unwrapped;
+		}
+		OtlpNormalizeObject(doc, value);
+		return value;
+	}
+	if (OtlpIsKeyValueArray(value)) {
+		// bare KeyValue list (kvlistValue payloads): becomes an object
+		auto converted = duckdb_yyjson::yyjson_mut_obj(doc);
+		duckdb_yyjson::yyjson_mut_arr_iter elements;
+		duckdb_yyjson::yyjson_mut_arr_iter_init(value, &elements);
+		while (auto element = duckdb_yyjson::yyjson_mut_arr_iter_next(&elements)) {
+			auto name = duckdb_yyjson::yyjson_mut_obj_get(element, "key");
+			auto inner = duckdb_yyjson::yyjson_mut_obj_get(element, "value");
+			if (name && duckdb_yyjson::yyjson_mut_is_str(name) && inner) {
+				auto normalized = OtlpNormalizeValue(doc, inner, "", 0);
+				duckdb_yyjson::yyjson_mut_obj_add(converted, name, normalized ? normalized : inner);
+			}
+		}
+		return converted;
+	}
+	if (duckdb_yyjson::yyjson_mut_is_arr(value)) {
+		duckdb_yyjson::yyjson_mut_arr_iter elements;
+		duckdb_yyjson::yyjson_mut_arr_iter_init(value, &elements);
+		vector<duckdb_yyjson::yyjson_mut_val *> originals;
+		while (auto element = duckdb_yyjson::yyjson_mut_arr_iter_next(&elements)) {
+			originals.push_back(element);
+		}
+		duckdb_yyjson::yyjson_mut_arr_clear(value);
+		for (auto element : originals) {
+			auto normalized = OtlpNormalizeValue(doc, element, "", 0);
+			duckdb_yyjson::yyjson_mut_arr_append(value, normalized ? normalized : element);
+		}
+		return value;
+	}
+	// protobuf uint64 timestamps arrive as digit strings
+	if (duckdb_yyjson::yyjson_mut_is_str(value) && key_len >= 8 && memcmp(key + key_len - 8, "UnixNano", 8) == 0) {
+		auto str = duckdb_yyjson::yyjson_mut_get_str(value);
+		int64_t parsed;
+		if (TryCast::Operation<string_t, int64_t>(string_t(str, duckdb_yyjson::yyjson_mut_get_len(value)), parsed)) {
+			return duckdb_yyjson::yyjson_mut_sint(doc, parsed);
+		}
+	}
+	return value;
+}
+
 void RawPayload::Explode(const vector<string> &path) {
 	auto mut_doc = duckdb_yyjson::yyjson_mut_doc_new(nullptr);
 	auto out_rows = duckdb_yyjson::yyjson_mut_arr(mut_doc);
@@ -191,6 +344,13 @@ void RawPayload::Explode(const vector<string> &path) {
 	vector<RawExplodeEnvelope> envelopes;
 	for (auto row : rows) {
 		ExplodeInto(mut_doc, out_rows, row, path, 0, envelopes);
+	}
+	if (otlp_semantics) {
+		duckdb_yyjson::yyjson_mut_arr_iter normalized_rows;
+		duckdb_yyjson::yyjson_mut_arr_iter_init(out_rows, &normalized_rows);
+		while (auto row = duckdb_yyjson::yyjson_mut_arr_iter_next(&normalized_rows)) {
+			OtlpNormalizeValue(mut_doc, row, "", 0);
+		}
 	}
 
 	auto exploded = duckdb_yyjson::yyjson_mut_doc_imut_copy(mut_doc, nullptr);
@@ -232,6 +392,7 @@ void RawPayloadAddDocument(RawParsedPayload &parsed, const char *data, idx_t siz
 void RawPayloadFinalize(RawParsedPayload &parsed, const RawParseOptions &options) {
 	CheckRowUniformity(parsed.payload.rows, parsed.payload.scalar_rows);
 	if (!options.explode_path.empty()) {
+		parsed.payload.otlp_semantics = options.otlp;
 		parsed.payload.Explode(options.explode_path);
 	}
 	parsed.root = parsed.payload.InferSchema();
@@ -267,6 +428,10 @@ bool ResolveBuiltinTransform(const string &name, string &path) {
 		}
 	}
 	return false;
+}
+
+bool RawTransformIsOtlp(const string &name) {
+	return StringUtil::StartsWith(StringUtil::Lower(name), "otlp-");
 }
 
 RawParseOptions RawExplodeOptions(const string &path) {
