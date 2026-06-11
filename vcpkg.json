@@ -1,10 +1,20 @@
 {
-	"dependencies": [],
+	"dependencies": [
+		{
+			"name": "grpc",
+			"platform": "!emscripten & !mingw"
+		},
+		{
+			"name": "protobuf",
+			"platform": "!emscripten & !mingw"
+		}
+	],
 	"vcpkg-configuration": {
 		"overlay-ports": [
 			"./extension-ci-tools/vcpkg_ports"
 		],
 		"overlay-triplets": [
+			"./vcpkg_triplets",
 			"./extension-ci-tools/toolchains"
 		]
 	}
