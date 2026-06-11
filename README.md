@@ -103,18 +103,48 @@ All ingest functions accept `transform := '...'`, `explode := '...'` and `ignore
 
 ## Async Inserts
 
-For high-rate clients, **asynchronous inserts** are available as an option. 
+### Asynchronous inserts
 
-`SET rawduck_async_insert = true`
+By default every `raw_ingest` call parses, evolves the schema, appends, and commits before
+returning — callers immediately see their rows. Under many concurrent writers issuing small
+payloads, that means one transaction per call. Asynchronous mode trades immediate visibility for
+throughput: calls enqueue the payload into a per-table buffer and return instantly, and a
+background flusher ingests each buffer as a single batch.
 
-For many concurrent small-insert clients this batches commits and serializes schema evolution
-through one flusher instead of racing across per-request transactions.
+```sql
+SET rawduck_async_insert = true;
 
-#### Async Parameters
-- `rawduck_async_max_data_size` (default 1 MB)
-- `rawduck_async_busy_timeout_ms` (default 200 ms)
-- `raw_flush()` command drains synchronously
+SELECT * FROM raw_ingest('events', '[{"id": 1, "action": "click"}]');  -- returns immediately, rows = 0
+SELECT * FROM raw_ingest('events', '[{"id": 2, "action": "view"}]');
 
+-- a buffer flushes when it exceeds the size threshold or its oldest entry exceeds the age
+-- threshold; force it when you need the data now:
+SELECT * FROM raw_flush();
+-- ┌─────────┬──────┐
+-- │ targets │ rows │
+-- │       1 │    2 │
+-- └─────────┴──────┘
+
+SELECT count(*) FROM events;   -- 2
+```
+
+| Setting / function | Default | Meaning |
+|---|---|---|
+| `rawduck_async_insert` | `false` | Enable buffered ingestion for `raw_ingest` / `raw_ingest_file`. |
+| `rawduck_async_max_data_size` | `1048576` | Flush a table's buffer once it holds this many bytes. |
+| `rawduck_async_busy_timeout_ms` | `200` | Flush a buffer once its oldest payload is this old. |
+| `raw_flush()` | — | Drain all buffers synchronously; returns `(targets, rows)`. |
+
+Semantics to know before enabling it:
+
+- Buffered payloads commit in the flusher's own transactions — a `ROLLBACK` in the calling
+  session does not un-enqueue them, and a failed background flush drops that batch.
+- Data buffered for less than the age threshold is lost if the database closes first; call
+  `raw_flush()` before shutdown.
+- The HTTP and gRPC servers ingest asynchronously by default (their clients are exactly the
+  many-small-writers case, and a single flusher also serializes schema evolution instead of
+  letting per-request transactions race on it). Start them with `async := false` to make every
+  request its own synchronous transaction.
 
 ## HTTP API
 
