@@ -23,6 +23,7 @@
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/optimistic_data_writer.hpp"
+#include "duckdb/storage/object_cache.hpp"
 #include "duckdb/storage/partial_block_manager.hpp"
 #include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -35,6 +36,45 @@
 #include <thread>
 
 namespace duckdb {
+
+//===--------------------------------------------------------------------===//
+// Schema-shape cache: high-rate small inserts mostly repeat the same payload
+// shape. Hash the (column, type) signature per payload; shapes already
+// absorbed by a table skip schema-delta work entirely. The cache validates
+// against the table's storage pointer, which changes on any ALTER.
+//===--------------------------------------------------------------------===//
+
+class RawSchemaCache : public ObjectCacheEntry {
+public:
+	static string ObjectType() {
+		return "rawduck_schema_shapes";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx();
+	}
+
+	struct Entry {
+		// validity token: the table's DataTable address at absorption time
+		void *storage_token = nullptr;
+		unordered_set<uint64_t> absorbed_shapes;
+	};
+	mutex lock;
+	unordered_map<string, Entry> tables;
+};
+
+static uint64_t HashPayloadShape(const vector<RawColumn> &columns) {
+	uint64_t shape = 0xcbf29ce484222325ULL;
+	for (auto &column : columns) {
+		for (auto c : column.name) {
+			shape = (shape ^ NumericCast<uint64_t>(StringUtil::CharacterToLower(c))) * 0x100000001b3ULL;
+		}
+		shape = (shape ^ static_cast<uint64_t>(column.type.id())) * 0x100000001b3ULL;
+	}
+	return shape;
+}
 
 //===--------------------------------------------------------------------===//
 // Type widening between an existing table column and incoming data
@@ -548,6 +588,66 @@ private:
 	void IngestNative(shared_ptr<RawParsedPayload> parsed_ptr) {
 		auto &parsed = *parsed_ptr;
 		auto table = LookupTable();
+		if (!table || parsed.columns.empty()) {
+			LegacyIngestNative(std::move(parsed_ptr), table);
+			return;
+		}
+		auto cache_key = qname.catalog + "." + qname.schema + "." + qname.name;
+		auto shape = HashPayloadShape(parsed.columns);
+		auto &cache = *ObjectCache::GetObjectCache(context).GetOrCreate<RawSchemaCache>(RawSchemaCache::ObjectType());
+		bool absorbed;
+		{
+			lock_guard<mutex> guard(cache.lock);
+			auto entry = cache.tables.find(cache_key);
+			absorbed = entry != cache.tables.end() && entry->second.storage_token == &table->GetStorage() &&
+			           entry->second.absorbed_shapes.count(shape) > 0;
+		}
+		if (!absorbed) {
+			// schema-delta slow path, then absorb the shape
+			auto &catalog = Catalog::GetCatalog(context, qname.catalog);
+			MetaTransaction::Get(context).ModifyDatabase(
+			    catalog.GetAttached(), DatabaseModificationType::ALTER_TABLE | DatabaseModificationType::INSERT_DATA);
+			vector<pair<string, LogicalType>> adds;
+			bool widens = false;
+			ComputeDelta(*table, parsed, adds, widens);
+			if (pool && widens) {
+				rows += pool->Drain(*table);
+				pool.reset();
+			}
+			EvolveNative(catalog, *table, parsed);
+			if (pool && !adds.empty()) {
+				pool->PublishColumns(adds);
+			}
+			table = LookupTable();
+			if (!table) {
+				throw InternalException("RawDuck: table %s disappeared during ingestion", target);
+			}
+			lock_guard<mutex> guard(cache.lock);
+			auto &entry = cache.tables[cache_key];
+			if (entry.storage_token != &table->GetStorage()) {
+				entry.storage_token = &table->GetStorage();
+				entry.absorbed_shapes.clear();
+			}
+			entry.absorbed_shapes.insert(shape);
+		}
+		if (parsed.payload.rows.empty()) {
+			return;
+		}
+		MetaTransaction::Get(context).ModifyDatabase(Catalog::GetCatalog(context, qname.catalog).GetAttached(),
+		                                             DatabaseModificationType::INSERT_DATA);
+		if (!pool && PoolEligible(*table, parsed)) {
+			auto worker_count = MaxValue<idx_t>(1, MinValue<idx_t>(std::thread::hardware_concurrency() / 2, 4));
+			pool = make_uniq<RawAppendPool>(context, *table, worker_count);
+		}
+		if (pool) {
+			pool->Submit(std::move(parsed_ptr));
+			return;
+		}
+		AppendNative(*table, parsed);
+	}
+
+	void LegacyIngestNative(shared_ptr<RawParsedPayload> parsed_ptr, optional_ptr<TableCatalogEntry> table) {
+		auto &parsed = *parsed_ptr;
 		if (!table && parsed.columns.empty()) {
 			throw InvalidInputException("RawDuck: cannot create table %s from an empty payload", target);
 		}

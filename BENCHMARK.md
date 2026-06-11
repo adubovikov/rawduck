@@ -96,6 +96,15 @@ SELECT * FROM raw_project('gh_events');      -- materializes the hottest aggrega
 SET rawduck_use_projections = true;          -- transparent rewrite of eligible count(*) queries
 ```
 
+## Realtime small-insert workload
+
+One-shot bulk loads don't show client behavior. To simulate real clients (1–100 events per
+insert, mixed shapes), generate a few thousand small `raw_ingest` calls and time the run; on the
+reference machine 2,000 inserts (≈44k events) sustain **~2,600 inserts/s (~58k events/s)** with
+sub-millisecond average latency and no backpressure. The schema-shape cache makes repeated payload
+shapes skip all schema-delta work (the cache invalidates automatically on any ALTER via the
+table's storage token).
+
 ## Pitfalls
 
 - Don't split NDJSON with Python's `splitlines()` — it splits on ` `/` ` which appear

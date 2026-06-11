@@ -364,3 +364,25 @@ SELECT k, count(*) FROM t_proj GROUP BY k ORDER BY k;
 ----
 a	2
 b	2
+
+#===----------------------------------------------------------------------===#
+# realtime-style small inserts: many tiny payloads with rotating shapes
+#===----------------------------------------------------------------------===#
+
+loop i 0 50
+
+statement ok
+SELECT * FROM raw_ingest('t_rt', '[{"u":"a${i}","v":${i}}]');
+
+statement ok
+SELECT * FROM raw_ingest('t_rt', '[{"u":"b${i}","page":"/p","ms":${i}.5},{"u":"c${i}","v":${i}}]');
+
+statement ok
+SELECT * FROM raw_ingest('t_rt', '{"svc":"api","code":${i}}');
+
+endloop
+
+query III
+SELECT count(*), count(DISTINCT u), max(code) FROM t_rt;
+----
+200	150	49
