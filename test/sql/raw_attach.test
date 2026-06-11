@@ -154,3 +154,34 @@ statement error
 SELECT * FROM raw2.ingest.clicks;
 ----
 <REGEX>:.*write-only.*
+
+# transforms apply to the INSERT lane via rawduck_insert_transform
+statement ok
+SET rawduck_insert_transform = 'otlp-traces';
+
+statement ok
+INSERT INTO raw2.ingest.spans VALUES ('{"resourceSpans":[{"resource":{"svc":"api"},"scopeSpans":[{"spans":[{"name":"s1","kind":2},{"name":"s2","kind":3}]}]}]}');
+
+statement ok
+RESET rawduck_insert_transform;
+
+query III
+SELECT name, kind, "resource.svc" FROM raw2.spans ORDER BY name;
+----
+s1	2	api
+s2	3	api
+
+# generic explode paths work through the same setting
+statement ok
+SET rawduck_insert_transform = 'data.items';
+
+statement ok
+INSERT INTO raw2.ingest.batchy VALUES ('{"env":"prod","data":{"items":[{"id":1},{"id":2}]}}');
+
+statement ok
+RESET rawduck_insert_transform;
+
+query II
+SELECT count(*), max(id) FROM raw2.batchy WHERE env = 'prod';
+----
+2	2

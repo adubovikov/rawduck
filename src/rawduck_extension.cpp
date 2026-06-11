@@ -33,6 +33,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	// observe pushed-down predicates to drive raw_optimize()
 	OptimizerExtension::Register(config, GetRawDuckOptimizerExtension());
+	config.AddExtensionOption("rawduck_insert_transform",
+	                          "Transform name or explode path applied by INSERTs into ingest tables",
+	                          LogicalType::VARCHAR, Value(""));
 	config.AddExtensionOption("rawduck_async_insert", "Buffer ingestion calls and flush asynchronously",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 	config.AddExtensionOption("rawduck_async_max_data_size", "Async insert buffer flush threshold in bytes",

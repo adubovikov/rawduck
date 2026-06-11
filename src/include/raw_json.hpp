@@ -73,8 +73,6 @@ struct RawPayload {
 	// InvalidInputException otherwise.
 	void Parse(const string &payload, const RawParseOptions &options = RawParseOptions());
 	unique_ptr<RawNode> InferSchema() const;
-
-private:
 	void Explode(const vector<string> &path);
 };
 
@@ -93,7 +91,7 @@ struct RawParsedPayload {
 // at a time straight from source memory, then finalize (uniformity check +
 // inference + flattening) once per batch.
 void RawPayloadAddDocument(RawParsedPayload &payload, const char *data, idx_t size, bool ignore_errors = false);
-void RawPayloadFinalize(RawParsedPayload &payload);
+void RawPayloadFinalize(RawParsedPayload &payload, const RawParseOptions &options = RawParseOptions());
 
 // Built-in ingest-time transforms (name -> dotted explode path); users can
 // register additional ones via raw_transform_define().

@@ -137,6 +137,7 @@ bool RawIsIngestTable(const TableCatalogEntry &table) {
 class RawIngestSinkState : public GlobalSinkState {
 public:
 	unique_ptr<RawStreamIngestor> ingestor;
+	RawParseOptions options;
 };
 
 class RawIngestLocalSinkState : public LocalSinkState {
@@ -172,7 +173,19 @@ public:
 
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
 		auto state = make_uniq<RawIngestSinkState>();
-		state->ingestor = RawCreateStreamIngestor(context, target, RawParseOptions());
+		// rawduck_insert_transform: a transform name or an explode path,
+		// applied to every payload this INSERT streams
+		Value setting;
+		if (context.TryGetCurrentSetting("rawduck_insert_transform", setting) && !setting.IsNull() &&
+		    !setting.GetValue<string>().empty()) {
+			auto value = setting.GetValue<string>();
+			try {
+				state->options = ResolveTransform(context, value, "");
+			} catch (...) {
+				state->options = ResolveTransform(context, "", value);
+			}
+		}
+		state->ingestor = RawCreateStreamIngestor(context, target, state->options);
 		return std::move(state);
 	}
 
@@ -196,7 +209,7 @@ public:
 			}
 			auto payload = strings[idx];
 			// objects and arrays both expand into rows here; no copies
-			RawPayloadAddDocument(*state.building, payload.GetData(), payload.GetSize());
+			RawPayloadAddDocument(*state.building, payload.GetData(), payload.GetSize(), gstate.options.ignore_errors);
 		}
 		if (state.building->payload.rows.size() >= BATCH_ROWS) {
 			FlushBuilding(gstate, state);
@@ -234,7 +247,7 @@ private:
 			}
 			return;
 		}
-		RawPayloadFinalize(*state.building);
+		RawPayloadFinalize(*state.building, gstate.options);
 		gstate.ingestor->IngestParsedConcurrent(std::move(state.building));
 		state.building.reset();
 	}

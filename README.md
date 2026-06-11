@@ -259,6 +259,15 @@ CALL raw_ingest('logs', payload, transform := 'cloudwatch-logs');
 CALL raw_ingest('events', payload, explode := 'batch.items');
 ```
 
+Transforms also apply to the INSERT lane through a session setting (a transform name or a
+dotted explode path):
+
+```sql
+SET rawduck_insert_transform = 'otlp-traces';
+INSERT INTO raw.ingest.spans SELECT json FROM read_json('traces.ndjson', ...);
+RESET rawduck_insert_transform;
+```
+
 Built-in transforms: `cloudwatch-logs`, `cloudtrail`, `firehose`, `otlp-traces`, `otlp-logs`,
 `otlp-metrics` (multi-level envelopes like `resourceSpans[].scopeSpans[].spans[]` are unwrapped
 with resource/scope fields merged into every row). Transforms are user-extensible — definitions

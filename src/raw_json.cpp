@@ -229,8 +229,11 @@ void RawPayloadAddDocument(RawParsedPayload &parsed, const char *data, idx_t siz
 	CollectRows(duckdb_yyjson::yyjson_doc_get_root(doc), parsed.payload.rows);
 }
 
-void RawPayloadFinalize(RawParsedPayload &parsed) {
+void RawPayloadFinalize(RawParsedPayload &parsed, const RawParseOptions &options) {
 	CheckRowUniformity(parsed.payload.rows, parsed.payload.scalar_rows);
+	if (!options.explode_path.empty()) {
+		parsed.payload.Explode(options.explode_path);
+	}
 	parsed.root = parsed.payload.InferSchema();
 	parsed.columns = FlattenSchema(*parsed.root, parsed.payload.scalar_rows);
 }
