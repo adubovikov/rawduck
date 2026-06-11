@@ -209,7 +209,10 @@ public:
 				continue;
 			}
 			total += count;
-			if (count < storage.GetRowGroupSize()) {
+			// merging in place is what makes the pool pay off: accept
+			// partially-filled row groups from half a row group up, and only
+			// re-append genuinely small remainders
+			if (count < storage.GetRowGroupSize() / 2) {
 				// few rows: append them to local storage directly
 				LocalAppendState append_state;
 				storage.InitializeLocalAppend(append_state, table, context, no_constraints);
@@ -881,16 +884,41 @@ struct RawIngestPipeline {
 		shared_ptr<RawParsedPayload> parsed;
 		string payload;
 	};
-	static constexpr idx_t CAPACITY = 2;
+	static constexpr idx_t CAPACITY = 4;
 
 	mutex lock;
 	std::condition_variable producer_cv;
 	std::condition_variable consumer_cv;
+	std::condition_variable parser_cv;
+	// raw NDJSON batches awaiting parsing
+	std::deque<string> raw_queue;
+	// parsed batches awaiting ingestion
 	std::deque<Item> queue;
-	bool finished = false;
+	idx_t active_parsers = 0;
+	bool reader_done = false;
 	bool aborted = false;
 	std::exception_ptr error;
 
+	void PushRaw(string batch) {
+		std::unique_lock<mutex> guard(lock);
+		producer_cv.wait(guard, [&] { return raw_queue.size() < CAPACITY || aborted; });
+		if (aborted) {
+			return;
+		}
+		raw_queue.push_back(std::move(batch));
+		parser_cv.notify_one();
+	}
+	bool PopRaw(string &batch) {
+		std::unique_lock<mutex> guard(lock);
+		parser_cv.wait(guard, [&] { return !raw_queue.empty() || reader_done || aborted; });
+		if (raw_queue.empty() || aborted) {
+			return false;
+		}
+		batch = std::move(raw_queue.front());
+		raw_queue.pop_front();
+		producer_cv.notify_one();
+		return true;
+	}
 	void Push(Item item) {
 		std::unique_lock<mutex> guard(lock);
 		producer_cv.wait(guard, [&] { return queue.size() < CAPACITY || aborted; });
@@ -902,7 +930,7 @@ struct RawIngestPipeline {
 	}
 	bool Pop(Item &item) {
 		std::unique_lock<mutex> guard(lock);
-		consumer_cv.wait(guard, [&] { return !queue.empty() || finished; });
+		consumer_cv.wait(guard, [&] { return !queue.empty() || (reader_done && active_parsers == 0); });
 		if (queue.empty()) {
 			return false;
 		}
@@ -911,17 +939,32 @@ struct RawIngestPipeline {
 		producer_cv.notify_one();
 		return true;
 	}
-	void Finish(std::exception_ptr producer_error) {
+	void ReaderDone(std::exception_ptr reader_error) {
 		std::unique_lock<mutex> guard(lock);
-		error = producer_error;
-		finished = true;
-		consumer_cv.notify_one();
+		if (reader_error && !error) {
+			error = reader_error;
+		}
+		reader_done = true;
+		parser_cv.notify_all();
+		consumer_cv.notify_all();
+	}
+	void ParserDone(std::exception_ptr parser_error) {
+		std::unique_lock<mutex> guard(lock);
+		if (parser_error && !error) {
+			error = parser_error;
+			aborted = true;
+			parser_cv.notify_all();
+			producer_cv.notify_all();
+		}
+		active_parsers--;
+		consumer_cv.notify_all();
 	}
 	void Abort() {
 		std::unique_lock<mutex> guard(lock);
 		aborted = true;
-		finished = true;
-		producer_cv.notify_one();
+		reader_done = true;
+		parser_cv.notify_all();
+		producer_cv.notify_all();
 	}
 };
 
@@ -943,20 +986,18 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 	auto options = bind_data.options;
 	auto batch_size = bind_data.batch_size;
 
-	// the parse thread owns the file handle; only parsing and inference run
-	// here, never anything that touches the ClientContext
-	std::thread parser([&pipeline, &handle, options, batch_size] {
-		std::exception_ptr producer_error;
+	// reader thread: owns the file handle, splits NDJSON into raw batches
+	std::thread reader([&pipeline, &handle, batch_size] {
+		std::exception_ptr reader_error;
 		try {
 			auto buffer = make_unsafe_uniq_array_uninitialized<char>(RAW_READ_BUFFER_SIZE);
 			string pending;
 			idx_t pending_lines = 0;
-			auto process = [&](string batch) {
+			auto emit = [&](string batch) {
 				if (batch.find_first_not_of(" \t\r\n") == string::npos) {
 					return;
 				}
-				auto parsed = RawParsedPayload::Process(batch, options);
-				pipeline.Push(RawIngestPipeline::Item {std::move(parsed), std::move(batch)});
+				pipeline.PushRaw(std::move(batch));
 			};
 			while (true) {
 				auto read = handle->Read(buffer.get(), RAW_READ_BUFFER_SIZE);
@@ -975,17 +1016,44 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 					for (idx_t line = 0; line < batch_size; line++) {
 						split = pending.find('\n', split) + 1;
 					}
-					process(pending.substr(0, split));
+					emit(pending.substr(0, split));
 					pending.erase(0, split);
 					pending_lines -= batch_size;
 				}
 			}
-			process(std::move(pending));
+			emit(std::move(pending));
 		} catch (...) {
-			producer_error = std::current_exception();
+			reader_error = std::current_exception();
 		}
-		pipeline.Finish(producer_error);
+		pipeline.ReaderDone(reader_error);
 	});
+
+	// parse workers: parsing and inference are pure and scale with cores;
+	// batch order is irrelevant to ingestion
+	auto parser_count = MaxValue<idx_t>(1, MinValue<idx_t>(std::thread::hardware_concurrency() / 4, 3));
+	pipeline.active_parsers = parser_count;
+	vector<std::thread> parsers;
+	for (idx_t i = 0; i < parser_count; i++) {
+		parsers.emplace_back([&pipeline, options] {
+			std::exception_ptr parser_error;
+			try {
+				string batch;
+				while (pipeline.PopRaw(batch)) {
+					auto parsed = RawParsedPayload::Process(batch, options);
+					pipeline.Push(RawIngestPipeline::Item {std::move(parsed), std::move(batch)});
+				}
+			} catch (...) {
+				parser_error = std::current_exception();
+			}
+			pipeline.ParserDone(parser_error);
+		});
+	}
+	auto join_all = [&] {
+		reader.join();
+		for (auto &parser : parsers) {
+			parser.join();
+		}
+	};
 
 	idx_t batches = 0;
 	try {
@@ -996,10 +1064,10 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 		}
 	} catch (...) {
 		pipeline.Abort();
-		parser.join();
+		join_all();
 		throw;
 	}
-	parser.join();
+	join_all();
 	if (pipeline.error) {
 		std::rethrow_exception(pipeline.error);
 	}

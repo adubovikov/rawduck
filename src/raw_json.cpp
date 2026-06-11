@@ -380,6 +380,10 @@ void MergeValue(RawNode &node, yyjson_val *val) {
 		return;
 	}
 	// scalar
+	if (node.node_class == RawNodeClass::SCALAR && node.scalar == RawScalarKind::VARCHAR) {
+		// already the scalar sink: no sniffing can change it
+		return;
+	}
 	auto kind = SniffScalarKind(val);
 	if (node.node_class == RawNodeClass::UNSET) {
 		node.node_class = RawNodeClass::SCALAR;
