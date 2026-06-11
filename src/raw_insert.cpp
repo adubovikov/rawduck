@@ -137,6 +137,10 @@ bool RawIsIngestTable(const TableCatalogEntry &table) {
 class RawIngestSinkState : public GlobalSinkState {
 public:
 	unique_ptr<RawStreamIngestor> ingestor;
+};
+
+class RawIngestLocalSinkState : public LocalSinkState {
+public:
 	// consecutive single-object payloads coalesce into NDJSON batches
 	string buffer;
 	idx_t buffered = 0;
@@ -157,6 +161,11 @@ public:
 	bool IsSink() const override {
 		return true;
 	}
+	bool ParallelSink() const override {
+		// each sink thread parses its own batches; the ingest handoff is
+		// internally serialized and appends fan out through the pool
+		return true;
+	}
 	bool IsSource() const override {
 		return true;
 	}
@@ -167,8 +176,13 @@ public:
 		return std::move(state);
 	}
 
+	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override {
+		return make_uniq<RawIngestLocalSinkState>();
+	}
+
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
-		auto &state = input.global_state.Cast<RawIngestSinkState>();
+		auto &gstate = input.global_state.Cast<RawIngestSinkState>();
+		auto &state = input.local_state.Cast<RawIngestLocalSinkState>();
 		UnifiedVectorFormat payloads;
 		chunk.data[0].ToUnifiedFormat(chunk.size(), payloads);
 		auto strings = UnifiedVectorFormat::GetData<string_t>(payloads);
@@ -190,22 +204,28 @@ public:
 				state.buffer.push_back('\n');
 				state.buffered++;
 				if (state.buffer.size() >= BATCH_BYTES) {
-					FlushBuffer(state);
+					FlushBuffer(gstate, state);
 				}
 			} else {
 				// arrays / NDJSON payloads ingest standalone
-				FlushBuffer(state);
-				state.ingestor->Ingest(string(data, size));
+				FlushBuffer(gstate, state);
+				gstate.ingestor->IngestConcurrent(string(data, size));
 			}
 		}
 		return SinkResultType::NEED_MORE_INPUT;
 	}
 
+	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override {
+		auto &gstate = input.global_state.Cast<RawIngestSinkState>();
+		auto &state = input.local_state.Cast<RawIngestLocalSinkState>();
+		FlushBuffer(gstate, state);
+		return SinkCombineResultType::FINISHED;
+	}
+
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	                          OperatorSinkFinalizeInput &input) const override {
-		auto &state = input.global_state.Cast<RawIngestSinkState>();
-		FlushBuffer(state);
-		state.ingestor->Finish();
+		auto &gstate = input.global_state.Cast<RawIngestSinkState>();
+		gstate.ingestor->Finish();
 		return SinkFinalizeType::READY;
 	}
 
@@ -218,11 +238,11 @@ public:
 	}
 
 private:
-	static void FlushBuffer(RawIngestSinkState &state) {
+	static void FlushBuffer(RawIngestSinkState &gstate, RawIngestLocalSinkState &state) {
 		if (state.buffered == 0) {
 			return;
 		}
-		state.ingestor->Ingest(state.buffer);
+		gstate.ingestor->IngestConcurrent(state.buffer);
 		state.buffer.clear();
 		state.buffered = 0;
 	}

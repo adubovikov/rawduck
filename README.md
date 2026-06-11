@@ -57,6 +57,10 @@ INSERT INTO raw.ingest.events SELECT json FROM read_json('events.ndjson',
 Ingest again with a different shape and the table follows the data: new keys become columns,
 conflicting types widen, missing keys read as `NULL` — nothing is ever dropped.
 
+Path guidance: `raw_ingest_file` is the fastest bulk lane (dedicated reader, parallel parse
+workers); the `ingest` schema INSERT is the most flexible (any SQL source, parallel sink) and the
+most comfortable syntax; `raw_ingest` is the endpoint for payload strings and the async buffer.
+
 ## Benchmark: one hour of GitHub, three ways
 
 Real [GH Archive](https://www.gharchive.org/) data — **247,199 GitHub events, 956 MB of NDJSON,

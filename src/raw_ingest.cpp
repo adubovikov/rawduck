@@ -982,10 +982,17 @@ namespace {
 class RawStreamIngestorImpl : public RawStreamIngestor {
 public:
 	RawStreamIngestorImpl(ClientContext &context, const string &target, RawParseOptions options)
-	    : ingestor(context, target, std::move(options)) {
+	    : parse_options(options), ingestor(context, target, std::move(options)) {
 	}
 	void Ingest(const string &payload) override {
 		ingestor.Ingest(payload);
+	}
+	void IngestConcurrent(const string &payload) override {
+		// parsing and inference are pure and run on the calling thread; the
+		// schema/append handoff serializes (appends fan out via the pool)
+		auto parsed = RawParsedPayload::Process(payload, parse_options);
+		lock_guard<mutex> guard(lock);
+		ingestor.IngestParsed(std::move(parsed), payload);
 	}
 	void Finish() override {
 		ingestor.Finish();
@@ -995,6 +1002,8 @@ public:
 	}
 
 private:
+	RawParseOptions parse_options;
+	mutex lock;
 	RawIngestor ingestor;
 };
 } // namespace

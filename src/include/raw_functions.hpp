@@ -49,6 +49,8 @@ class RawStreamIngestor {
 public:
 	virtual ~RawStreamIngestor() = default;
 	virtual void Ingest(const string &payload) = 0;
+	// thread-safe: parses on the calling thread, serializes only the handoff
+	virtual void IngestConcurrent(const string &payload) = 0;
 	virtual void Finish() = 0;
 	virtual idx_t Rows() const = 0;
 };
