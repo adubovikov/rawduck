@@ -19,9 +19,9 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/httplib)
 
 # Optional OTLP/gRPC ingestion server: enabled when gRPC and protobuf are
 # available (vcpkg in CI, system packages locally). Never built for wasm.
-option(RAWDUCK_DISABLE_GRPC "Build without the OTLP/gRPC server (OTLP/HTTP only)" OFF)
+option(RAWDUCK_ENABLE_GRPC "Build the OTLP/gRPC ingestion server (requires gRPC + protobuf)" OFF)
 set(RAWDUCK_GRPC_ENABLED FALSE)
-if(NOT EMSCRIPTEN AND NOT MINGW AND NOT RAWDUCK_DISABLE_GRPC)
+if(RAWDUCK_ENABLE_GRPC AND NOT EMSCRIPTEN AND NOT MINGW)
   find_package(gRPC CONFIG QUIET)
   find_package(Protobuf CONFIG QUIET)
   if(NOT TARGET protobuf::libprotobuf)

@@ -226,7 +226,8 @@ static void RawServeGrpcFunction(ClientContext &context, TableFunctionInput &dat
 #ifndef RAWDUCK_WITH_GRPC
 	throw NotImplementedException(
 	    "RawDuck: this build does not include OTLP/gRPC support (gRPC was unavailable at build time, this is a "
-	    "wasm build, or it was disabled via RAWDUCK_DISABLE_GRPC); use the OTLP/HTTP endpoints instead");
+	    "wasm build, or the build did not enable it - rebuild with RAWDUCK_ENABLE_GRPC=1); use the OTLP/HTTP endpoints "
+	    "instead");
 #else
 	auto &grpc_state = GetGrpcState();
 	lock_guard<mutex> guard(grpc_state.lock);

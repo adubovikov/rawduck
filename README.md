@@ -211,8 +211,8 @@ headers (the generic `x-rawduck-table` also works). Responses are OTLP-conforman
 
 ### OTLP/gRPC
 
-Builds with gRPC available (vcpkg in CI, system packages locally; not wasm) also serve the
-standard OpenTelemetry collector services natively:
+Builds made with `make release RAWDUCK_ENABLE_GRPC=1` (see Building) also serve the standard
+OpenTelemetry collector services natively:
 
 ```sql
 SELECT * FROM raw_serve_grpc(port := 4317, token := 'rt_secret');   -- TraceService/LogsService/MetricsService
@@ -346,10 +346,11 @@ git submodule update --init
 GEN=ninja make release
 ```
 
-The OTLP/gRPC server compiles in automatically when gRPC and protobuf are available (vcpkg in CI,
-system packages locally) and is always skipped for wasm. To build without it even when available
-(OTLP/HTTP keeps working): `make release RAWDUCK_DISABLE_GRPC=1` (the flag is cached per build
-directory; run `make clean` when toggling it).
+The OTLP/gRPC server is **opt-in at build time** (it pulls the gRPC/protobuf stack, which
+significantly lengthens builds): `make release RAWDUCK_ENABLE_GRPC=1` enables it, using the
+`grpc` vcpkg manifest feature in CI or system gRPC/protobuf locally. Default builds skip it —
+OTLP/HTTP stays fully functional and `raw_serve_grpc()` explains how to enable support. The flag
+is cached per build directory; run `make clean` when toggling it. wasm builds never include it.
 
 Artifacts:
 

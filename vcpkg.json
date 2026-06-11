@@ -1,14 +1,22 @@
 {
-	"dependencies": [
-		{
-			"name": "grpc",
-			"platform": "!emscripten & !mingw"
-		},
-		{
-			"name": "protobuf",
-			"platform": "!emscripten & !mingw"
+	"name": "rawduck",
+	"version": "1.0.0",
+	"dependencies": [],
+	"features": {
+		"grpc": {
+			"description": "OTLP/gRPC ingestion server",
+			"dependencies": [
+				{
+					"name": "grpc",
+					"platform": "!emscripten & !mingw"
+				},
+				{
+					"name": "protobuf",
+					"platform": "!emscripten & !mingw"
+				}
+			]
 		}
-	],
+	},
 	"vcpkg-configuration": {
 		"overlay-ports": [
 			"./extension-ci-tools/vcpkg_ports"
