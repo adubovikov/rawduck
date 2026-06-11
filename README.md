@@ -104,7 +104,7 @@ WHERE type = 'PushEvent' GROUP BY 1 ORDER BY pushes DESC LIMIT 10;           -- 
 | `raw_ingest_file(table, path, batch_size := 30000)` | table | Streaming ingest of NDJSON files (gzip auto-detected, any DuckDB filesystem) in bounded-memory batches, evolving the schema between batches. The whole file is one atomic operation. |
 | `raw_records(payload)` | table | Parse + infer + flatten a JSON payload into typed rows without touching any table. |
 | `raw_stats()` | table | Observed usage statistics per column: pushed-down filters and GROUP BY keys, collected automatically by an optimizer hook. |
-| `raw_optimize(table)` | table | RawMergeTree-style adaptive layout: physically reorders the table by its hottest columns. Incremental: append-only growth since the last optimize sorts only the new tail into a fresh sorted run (`mode` = `full` / `incremental` / `noop`). |
+| `raw_optimize(table)` | table | RawMergeTree adaptive layout: physically reorders the table by its hottest columns. Incremental: append-only growth since the last optimize sorts only the new tail into a fresh sorted run (`mode` = `full` / `incremental` / `noop`). |
 | `raw_transforms()` / `raw_transform_define(name, path)` | table / scalar | List and register ingest-time transforms; definitions compose with `read_json`, tables, or any query. |
 | `raw_stats_save(catalog?)` / `raw_stats_load(catalog?)` | table | Persist observed statistics into a store (`__rawduck_stats` table) and merge them back after restart. |
 | `raw_projections()` | table | The projection advisor: GROUP BY shapes queries actually run, with observation counts and materialization status. |
@@ -162,7 +162,7 @@ Semantics to know before enabling it:
 
 ## HTTP API
 
-RawDuck can serve an in-process HTTP API for RawMergeTree-style ingestion and querying
+RawDuck can serve an in-process HTTP API for ingestion and querying
 
 ```sql
 SELECT * FROM raw_serve(host := '127.0.0.1', port := 9999, token := 'rt_secret');
