@@ -101,6 +101,13 @@ WHERE type = 'PushEvent' GROUP BY 1 ORDER BY pushes DESC LIMIT 10;           -- 
 
 All ingest functions accept `transform := '...'`, `explode := '...'` and `ignore_errors := true`.
 
+For high-rate clients, ClickHouse-style **asynchronous inserts** are available as an option:
+`SET rawduck_async_insert = true` makes ingestion calls enqueue and return immediately, while a
+background flusher coalesces per-table buffers and ingests them in one transaction when a buffer
+exceeds `rawduck_async_max_data_size` (default 1 MB) or its oldest entry exceeds
+`rawduck_async_busy_timeout_ms` (default 200 ms). `raw_flush()` drains synchronously. Semantics
+match fire-and-forget async inserts: a failed background flush drops that batch.
+
 ## HTTP API
 
 RawDuck can serve an in-process HTTP API for RawMergeTree-style ingestion and querying

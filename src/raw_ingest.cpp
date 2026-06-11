@@ -1036,6 +1036,18 @@ static void RawIngestFunction(ClientContext &context, TableFunctionInput &data, 
 	}
 	state.done = true;
 
+	if (RawAsyncEnabled(context)) {
+		// fire-and-forget: enqueue and return; the background flusher ingests
+		RawAsyncEnqueue(context, bind_data.target, bind_data.payload, bind_data.options);
+		output.SetValue(0, 0, Value(bind_data.target));
+		output.SetValue(1, 0, Value::BOOLEAN(false));
+		output.SetValue(2, 0, Value::BIGINT(0));
+		output.SetValue(3, 0, Value::BIGINT(0));
+		output.SetValue(4, 0, Value::BIGINT(0));
+		output.SetValue(5, 0, Value::BIGINT(0));
+		output.SetCardinality(1);
+		return;
+	}
 	RawIngestor ingestor(context, bind_data.target, bind_data.options);
 	ingestor.Ingest(bind_data.payload);
 	ingestor.Finish();

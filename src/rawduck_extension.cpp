@@ -27,11 +27,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(GetRawServeStopFunction());
 	loader.RegisterFunction(GetRawServeGrpcFunction());
 	loader.RegisterFunction(GetRawServeGrpcStopFunction());
+	loader.RegisterFunction(GetRawFlushFunction());
 	loader.RegisterFunction(GetRawTransformDefineFunction());
 
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	// observe pushed-down predicates to drive raw_optimize()
 	OptimizerExtension::Register(config, GetRawDuckOptimizerExtension());
+	config.AddExtensionOption("rawduck_async_insert", "Buffer ingestion calls and flush asynchronously",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("rawduck_async_max_data_size", "Async insert buffer flush threshold in bytes",
+	                          LogicalType::BIGINT, Value::BIGINT(1024 * 1024));
+	config.AddExtensionOption("rawduck_async_busy_timeout_ms", "Async insert buffer flush age threshold",
+	                          LogicalType::BIGINT, Value::BIGINT(200));
 	config.AddExtensionOption("rawduck_use_projections",
 	                          "Rewrite eligible count(*) aggregations onto fresh materialized projections "
 	                          "(append-only workloads)",

@@ -40,6 +40,9 @@ TableFunction GetRawServeFunction();
 TableFunction GetRawServeStopFunction();
 TableFunction GetRawServeGrpcFunction();
 TableFunction GetRawServeGrpcStopFunction();
+TableFunction GetRawFlushFunction();
+bool RawAsyncEnabled(ClientContext &context);
+void RawAsyncEnqueue(ClientContext &context, const string &target, string payload, RawParseOptions options);
 
 // shared SQL generation helpers
 string RawQuoteIdentifier(const string &name);

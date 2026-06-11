@@ -109,7 +109,9 @@ insert, mixed shapes), generate a few thousand small `raw_ingest` calls and time
 reference machine 2,000 inserts (≈44k events) sustain **~2,600 inserts/s (~58k events/s)** with
 sub-millisecond average latency and no backpressure. The schema-shape cache makes repeated payload
 shapes skip all schema-delta work (the cache invalidates automatically on any ALTER via the
-table's storage token).
+table's storage token). With `SET rawduck_async_insert = true` the same workload completes in
+~0.56 s (~3,600 inserts/s): calls return immediately and the background flusher coalesces buffers
+into larger transactional batches (`raw_flush()` drains the tail).
 
 ## Pitfalls
 
