@@ -21,52 +21,49 @@ filter on (incrementally, MergeTree-parts style) and answering recurring aggrega
 
 ## Usage
 
+Attach a store and `INSERT` raw JSON — tables, typed columns, and schema all emerge from the data:
+
 ```sql
 ATTACH 'rawduck:store.db' AS raw;
 
 -- no table 'events' exists yet
-SELECT * FROM raw_ingest('raw.events', '[
-    {"id": 1, "action": "click", "ts": "2024-01-15T10:30:00", "user": {"name": "alice", "plan": "pro"}},
-    {"id": 2, "action": "view",  "ts": "2024-01-15T10:31:00", "user": {"name": "bob"}}
-]');
+INSERT INTO raw.ingest.events VALUES
+    ('{"id": 1, "action": "click", "ts": "2024-01-15T10:30:00", "user": {"name": "alice", "plan": "pro"}}'),
+    ('{"id": 2, "action": "view",  "ts": "2024-01-15T10:31:00", "user": {"name": "bob"}}');
 
 DESCRIBE raw.events;
 -- id BIGINT, action VARCHAR, ts TIMESTAMP, user.name VARCHAR, user.plan VARCHAR
+
+SELECT "user.name", count(*) FROM raw.events GROUP BY 1;
 ```
 
-RawMergeTree tables are regular DuckDB tables — every query, statement, and tool works
-transparently at native speed:
+The `ingest` schema accepts any SQL source through a fully parallel zero-copy sink
+(**6.1M rows/s** on narrow JSON; a 956 MB heterogeneous NDJSON file in ~6 s):
 
 ```sql
-SELECT "user.name", count(*) FROM raw.events GROUP BY 1;
-INSERT INTO raw.events VALUES (3, 'buy', now(), 'carol', 'pro');
+INSERT INTO raw.ingest.events SELECT json FROM read_json('events.ndjson',
+    format='newline_delimited', records='false', columns={json: 'JSON'});
+
+SELECT * FROM raw_ingest_file('raw.events', 'events.ndjson.gz');   -- or the one-call file loader
+```
+
+Ingest a different shape and the table follows the data: new keys become columns, conflicting
+types widen, missing keys read as `NULL` — nothing is ever dropped. And RawMergeTree tables stay
+regular DuckDB tables, so every statement and tool works at native speed:
+
+```sql
 UPDATE raw.events SET "user.plan" = 'enterprise' WHERE id = 1;
 CREATE TABLE raw.daily AS SELECT date_trunc('day', ts) AS day, count(*) FROM raw.events GROUP BY 1;
 ```
 
-Inside a RawDuck store, plain `INSERT` works too — the virtual `ingest` schema accepts raw JSON
-payloads and streams them into the real table of the same name, auto-creation and evolution
-included:
-
-```sql
-INSERT INTO raw.ingest.events VALUES ('{"id": 3, "action": "buy", "amount": 99.5}');
-INSERT INTO raw.ingest.events SELECT json FROM read_json('events.ndjson',
-    format='newline_delimited', records='false', columns={json: 'JSON'});
-```
-
-Ingest again with a different shape and the table follows the data: new keys become columns,
-conflicting types widen, missing keys read as `NULL` — nothing is ever dropped.
-
-Path guidance: the `ingest` schema INSERT is both the most flexible lane (any SQL source) and the
-fastest — a fully parallel zero-copy sink that parses documents straight from source vectors
-(**6.1M rows/s** on narrow JSON; the 956 MB GH Archive hour in ~5–6 s). `raw_ingest_file` is the
-self-contained file loader; `raw_ingest` is the endpoint for payload strings and the async buffer.
+For ingestion outside a RawDuck store (the default in-memory catalog, DuckLake, the async buffer),
+`raw_ingest('table', payload)` is the function-call equivalent with the same engine underneath.
 
 ## Benchmark: one hour of GitHub, three ways
 
 Real [GH Archive](https://www.gharchive.org/) data — **247,199 GitHub events, 956 MB of NDJSON,
-wildly heterogeneous payloads** (the dataset RawBench uses). One `raw_ingest_file` call shredded it
-into **914 typed columns**, schema evolution included. The baseline is the standard DuckDB JSON
+wildly heterogeneous payloads** (the dataset RawBench uses). One `INSERT` shredded it into
+**914 typed columns**, schema evolution included. The baseline is the standard DuckDB JSON
 extension pattern: a single `JSON` column queried with `->>` paths.
 
 Same machine (Apple Silicon, DuckDB v1.5.3), best of 3:
@@ -93,8 +90,8 @@ strings, in exchange for every later query being 45–265× faster and the data 
 ```sql
 INSERT INTO raw.ingest.gh_events SELECT json::VARCHAR FROM read_json(...);  -- ~6s, 914 columns
 
-SELECT type, count(*) FROM gh_events GROUP BY type ORDER BY 2 DESC;          -- 1 ms
-SELECT "repo.name", count(*) AS pushes FROM gh_events
+SELECT type, count(*) FROM raw.gh_events GROUP BY type ORDER BY 2 DESC;      -- 1 ms
+SELECT "repo.name", count(*) AS pushes FROM raw.gh_events
 WHERE type = 'PushEvent' GROUP BY 1 ORDER BY pushes DESC LIMIT 10;           -- 3 ms
 ```
 
@@ -102,6 +99,7 @@ WHERE type = 'PushEvent' GROUP BY 1 ORDER BY pushes DESC LIMIT 10;           -- 
 
 | Function | Kind | Description |
 |---|---|---|
+| `INSERT INTO <store>.ingest.<table> ...` | SQL | The primary lane: any VALUES or SELECT source streams through a parallel zero-copy sink into `<table>`, auto-creation and evolution included. |
 | `raw_ingest(table, payload)` | table | Schema-less ingest: auto-creates the table, adds new columns, widens conflicting types, appends — natively, inside your transaction. Accepts a JSON array, a single object, scalars, or NDJSON. Returns `(table, created, columns_added, columns_widened, rows, errors)`. |
 | `raw_ingest_file(table, path, batch_size := 30000)` | table | Streaming ingest of NDJSON files (gzip auto-detected, any DuckDB filesystem) in bounded-memory batches, evolving the schema between batches. The whole file is one atomic operation. |
 | `raw_records(payload)` | table | Parse + infer + flatten a JSON payload into typed rows without touching any table. |
@@ -112,14 +110,14 @@ WHERE type = 'PushEvent' GROUP BY 1 ORDER BY pushes DESC LIMIT 10;           -- 
 | `raw_projections()` | table | The projection advisor: GROUP BY shapes queries actually run, with observation counts and materialization status. |
 | `raw_project(table)` | table | RawMergeTree auto-projections: materializes the hottest observed aggregation as a lightweight `<table>__proj` summary table. |
 | `raw_serve(host, port, token)` / `raw_serve_stop()` | table | Start/stop the in-process HTTP API (see below). |
+| `raw_serve_grpc(host, port, token)` / `raw_serve_grpc_stop()` | table | Start/stop the OTLP/gRPC collector (opt-in build, see Building). |
+| `raw_flush()` | table | Synchronously drain the async-insert buffers. |
 | `raw_type(json)` | scalar | Concrete type of a JSON value (RawMergeTree's `dynamicType()`): `Null`, `Bool`, `Int64`, `UInt64`, `Double`, `String`, `Array`, `Object`. |
 | `raw_infer(json)` | scalar | The DuckDB type RawDuck assigns to a value, e.g. `BIGINT`, `DOUBLE[]`, or the flattened layout for objects: `OBJECT(a BIGINT, b.c VARCHAR)`. |
 
 All ingest functions accept `transform := '...'`, `explode := '...'` and `ignore_errors := true`.
 
-## Async Inserts
-
-### Asynchronous inserts
+## Asynchronous inserts
 
 By default every `raw_ingest` call parses, evolves the schema, appends, and commits before
 returning — callers immediately see their rows. Under many concurrent writers issuing small
@@ -241,10 +239,9 @@ do — joins, window functions, updates, exports, other extensions — works on 
 transparently and at full native speed, while the store identifies itself for RawDuck's ingestion
 and adaptive-layout machinery. Stores persist and reattach like any database file.
 
-Note on transparency limits: DuckDB's binder resolves `INSERT` column lists against the current
-schema, so a plain `INSERT` cannot create tables or add columns (no catalog can change that —
-binding happens before any catalog hook). Schema-less creation and evolution flow through the
-ingest functions, which run in the same transaction as the rest of your statements.
+Two kinds of `INSERT` coexist: typed inserts into the real tables behave exactly like DuckDB
+(fixed columns, binder-validated), while inserts into the virtual `ingest` schema take raw JSON
+payloads and handle creation and evolution. Both run in your transaction.
 
 ## Transforms
 
