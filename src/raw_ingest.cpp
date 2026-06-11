@@ -23,7 +23,9 @@
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/optimistic_data_writer.hpp"
+#include "duckdb/storage/partial_block_manager.hpp"
 #include "duckdb/storage/table/append_state.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
@@ -160,17 +162,22 @@ static unique_ptr<MaterializedQueryResult> RunQuery(Connection &conn, const stri
 class RawAppendPool {
 public:
 	RawAppendPool(ClientContext &context, TableCatalogEntry &table, idx_t worker_count)
-	    : context(context), table(table), storage(table.GetStorage()), types(table.GetTypes()) {
+	    : context(context), block_manager_ref(table.GetStorage().GetTableIOManager().GetBlockManagerForRowData()),
+	      types(table.GetTypes()) {
+		auto &storage = table.GetStorage();
 		idx_t physical_index = 0;
 		for (auto &column : table.GetColumns().Physical()) {
 			slots[column.Name()] = physical_index++;
 		}
 		workers = vector<Worker>(worker_count);
 		for (auto &worker : workers) {
+			worker.local_types = types;
+			worker.local_slots = slots;
 			worker.writer = make_uniq<OptimisticDataWriter>(context, storage);
 			auto collection = worker.writer->CreateCollection(storage, types);
 			collection->collection->InitializeEmpty();
-			collection->collection->InitializeAppend(worker.append_state);
+			worker.append_state = make_uniq<TableAppendState>();
+			collection->collection->InitializeAppend(*worker.append_state);
 			auto index = storage.CreateOptimisticCollection(context, std::move(collection));
 			worker.collection = &storage.GetOptimisticCollection(context, index);
 		}
@@ -193,38 +200,77 @@ public:
 		worker_cv.notify_one();
 	}
 
-	// stops the workers and merges their collections; returns appended rows
-	idx_t Drain() {
+	// Drain-free, barrier-free schema evolution: the consumer publishes new
+	// columns to an append-only list; each worker pads its own collection to
+	// the published prefix when it next picks up a batch. Worker layouts are
+	// always a prefix of the table layout, so merges stay positional.
+	void PublishColumns(const vector<pair<string, LogicalType>> &new_columns) {
+		std::unique_lock<mutex> guard(lock);
+		for (auto &new_column : new_columns) {
+			slots[new_column.first] = types.size();
+			types.push_back(new_column.second);
+		}
+	}
+
+	// stops the workers and merges their collections; returns appended rows.
+	// ALTERs swap the table's storage object, so the merge target must be
+	// the CURRENT catalog entry, not the one captured at pool creation.
+	idx_t Drain(TableCatalogEntry &current_table) {
+		auto &storage = current_table.GetStorage();
 		Stop();
 		if (error) {
 			std::rethrow_exception(error);
 		}
 		idx_t total = 0;
+		auto merge_threshold = storage.GetRowGroupSize() / 8;
+		// phase 1, parallel: finalize and flush each worker's collection.
+		// Writers capture the table's storage for compression metadata, so
+		// they are rebuilt against the CURRENT (possibly evolved) storage.
+		vector<std::thread> flushers;
+		for (auto &worker : workers) {
+			// pad to the full published schema so layouts match the table
+			vector<pair<string, LogicalType>> missing;
+			for (auto &slot : slots) {
+				if (slot.second >= worker.local_types.size()) {
+					missing.resize(MaxValue<idx_t>(missing.size(), slot.second - worker.local_types.size() + 1));
+					missing[slot.second - worker.local_types.size()] = {slot.first, types[slot.second]};
+				}
+			}
+			if (!missing.empty()) {
+				ExtendWorker(worker, missing);
+			}
+			worker.writer = make_uniq<OptimisticDataWriter>(context, storage);
+			flushers.emplace_back([&worker, merge_threshold] {
+				auto &collection = *worker.collection->collection;
+				collection.FinalizeAppend(TransactionData(0, 0), *worker.append_state);
+				if (collection.GetTotalRows() >= merge_threshold) {
+					worker.writer->WriteUnflushedRowGroups(*worker.collection);
+					worker.writer->FinalFlush();
+				}
+			});
+		}
+		for (auto &flusher : flushers) {
+			flusher.join();
+		}
+		// phase 2, serial: cheap pointer-level merges into local storage
 		vector<unique_ptr<BoundConstraint>> no_constraints;
 		for (auto &worker : workers) {
 			auto &collection = *worker.collection->collection;
-			collection.FinalizeAppend(TransactionData(0, 0), worker.append_state);
 			auto count = collection.GetTotalRows();
 			if (count == 0) {
 				continue;
 			}
 			total += count;
-			// merging in place is what makes the pool pay off: accept
-			// partially-filled row groups from half a row group up, and only
-			// re-append genuinely small remainders
-			if (count < storage.GetRowGroupSize() / 2) {
-				// few rows: append them to local storage directly
+			if (count < merge_threshold) {
+				// genuinely small remainders: append to local storage directly
 				LocalAppendState append_state;
-				storage.InitializeLocalAppend(append_state, table, context, no_constraints);
-				auto &transaction = DuckTransaction::Get(context, table.catalog);
+				storage.InitializeLocalAppend(append_state, current_table, context, no_constraints);
+				auto &transaction = DuckTransaction::Get(context, current_table.catalog);
 				for (auto &chunk : collection.Chunks(transaction)) {
 					storage.LocalAppend(append_state, context, chunk, false);
 				}
 				storage.FinalizeLocalAppend(append_state);
 			} else {
-				// row groups were written optimistically: merge them in place
-				worker.writer->WriteUnflushedRowGroups(*worker.collection);
-				worker.writer->FinalFlush();
 				storage.LocalMerge(context, *worker.collection);
 				storage.GetOptimisticWriter(context).Merge(*worker.writer);
 			}
@@ -237,7 +283,10 @@ private:
 	struct Worker {
 		unique_ptr<OptimisticDataWriter> writer;
 		optional_ptr<OptimisticWriteCollection> collection;
-		TableAppendState append_state;
+		unique_ptr<TableAppendState> append_state;
+		// this worker's collection layout: a prefix of the published schema
+		vector<LogicalType> local_types;
+		case_insensitive_map_t<idx_t> local_slots;
 	};
 
 	void Stop() {
@@ -256,9 +305,10 @@ private:
 	void WorkerLoop(Worker &worker) {
 		try {
 			DataChunk chunk;
-			chunk.Initialize(Allocator::Get(context), types);
+			chunk.Initialize(Allocator::Get(context), worker.local_types);
 			while (true) {
 				shared_ptr<RawParsedPayload> parsed;
+				vector<pair<string, LogicalType>> pending_columns;
 				{
 					std::unique_lock<mutex> guard(lock);
 					worker_cv.wait(guard, [&] { return !queue.empty() || stopped; });
@@ -267,7 +317,23 @@ private:
 					}
 					parsed = std::move(queue.front());
 					queue.pop_front();
+					// snapshot published columns this worker has not added yet
+					for (idx_t i = worker.local_types.size(); i < types.size(); i++) {
+						pending_columns.emplace_back(string(), types[i]);
+					}
+					idx_t pending_index = 0;
+					for (auto &slot : slots) {
+						if (slot.second >= worker.local_types.size()) {
+							pending_columns[slot.second - worker.local_types.size()].first = slot.first;
+						}
+						(void)pending_index;
+					}
 					producer_cv.notify_one();
+				}
+				if (!pending_columns.empty()) {
+					ExtendWorker(worker, pending_columns);
+					chunk.Destroy();
+					chunk.Initialize(Allocator::Get(context), worker.local_types);
 				}
 				AppendBatch(worker, *parsed, chunk);
 			}
@@ -282,7 +348,31 @@ private:
 		}
 	}
 
+	// pads this worker's collection with NULL-filled columns: metadata-only
+	// work through RowGroupCollection::AddColumn
+	void ExtendWorker(Worker &worker, const vector<pair<string, LogicalType>> &new_columns) {
+		worker.collection->collection->FinalizeAppend(TransactionData(0, 0), *worker.append_state);
+		for (auto &new_column : new_columns) {
+			ColumnDefinition definition(new_column.first, new_column.second);
+			BoundConstantExpression null_default(Value(new_column.second));
+			ExpressionExecutor default_executor(context, null_default);
+			worker.collection->collection =
+			    worker.collection->collection->AddColumn(context, definition, default_executor);
+			if (!worker.collection->partial_block_managers.empty()) {
+				auto &block_manager = block_manager_ref;
+				worker.collection->partial_block_managers.push_back(make_uniq<PartialBlockManager>(
+				    QueryContext(context), block_manager, PartialBlockType::APPEND_TO_TABLE));
+			}
+			worker.local_slots[new_column.first] = worker.local_types.size();
+			worker.local_types.push_back(new_column.second);
+		}
+		worker.append_state = make_uniq<TableAppendState>();
+		worker.collection->collection->InitializeAppend(*worker.append_state);
+	}
+
 	void AppendBatch(Worker &worker, RawParsedPayload &parsed, DataChunk &chunk) {
+		auto &types = worker.local_types;
+		auto &slots = worker.local_slots;
 		RawExtractor extractor(*parsed.root, parsed.columns);
 		vector<idx_t> slot_of(parsed.columns.size());
 		vector<bool> covered(types.size(), false);
@@ -319,9 +409,10 @@ private:
 				}
 			}
 			chunk.SetCardinality(count);
-			if (collection_of(worker).Append(chunk, worker.append_state)) {
-				worker.writer->WriteNewRowGroup(*worker.collection);
-			}
+			// collections stay purely in-memory: schema evolution can then
+			// extend them safely, and flushing happens in parallel at drain
+			// with the final layout
+			collection_of(worker).Append(chunk, *worker.append_state);
 		}
 	}
 
@@ -330,8 +421,7 @@ private:
 	}
 
 	ClientContext &context;
-	TableCatalogEntry &table;
-	DataTable &storage;
+	BlockManager &block_manager_ref;
 	vector<LogicalType> types;
 	case_insensitive_map_t<idx_t> slots;
 	vector<Worker> workers;
@@ -393,7 +483,11 @@ public:
 	// ingestion result is read
 	void Finish() {
 		if (pool) {
-			rows += pool->Drain();
+			auto table = LookupTable();
+			if (!table) {
+				throw InternalException("RawDuck: table %s disappeared during ingestion", target);
+			}
+			rows += pool->Drain(*table);
 			pool.reset();
 		}
 	}
@@ -420,19 +514,20 @@ private:
 		return &entry->Cast<TableCatalogEntry>();
 	}
 
-	// whether evolution would need DDL for this payload
-	bool NeedsDDL(TableCatalogEntry &table, RawParsedPayload &parsed) {
+	// classifies the DDL this payload would require
+	void ComputeDelta(TableCatalogEntry &table, RawParsedPayload &parsed, vector<pair<string, LogicalType>> &adds,
+	                  bool &widens) {
 		auto &existing_columns = table.GetColumns();
 		for (auto &column : parsed.columns) {
 			if (!existing_columns.ColumnExists(column.name)) {
-				return true;
+				adds.emplace_back(column.name, column.type);
+				continue;
 			}
 			auto &existing = existing_columns.GetColumn(column.name);
 			if (JoinColumnTypes(existing.Type(), column.type) != existing.Type()) {
-				return true;
+				widens = true;
 			}
 		}
-		return false;
 	}
 
 	bool PoolEligible(TableCatalogEntry &table, RawParsedPayload &parsed) {
@@ -470,12 +565,20 @@ private:
 			created = true;
 			columns_added += parsed.columns.size();
 		} else {
-			if (pool && NeedsDDL(*table, parsed)) {
-				// the pool's schema is frozen: merge its work before altering
-				rows += pool->Drain();
+			vector<pair<string, LogicalType>> adds;
+			bool widens = false;
+			ComputeDelta(*table, parsed, adds, widens);
+			if (pool && widens) {
+				// type rewrites cannot be applied to outstanding collections:
+				// merge the pool's work before altering
+				rows += pool->Drain(*table);
 				pool.reset();
 			}
 			EvolveNative(catalog, *table, parsed);
+			if (pool && !adds.empty()) {
+				// drain-free, barrier-free: workers pad their own collections
+				pool->PublishColumns(adds);
+			}
 		}
 		if (parsed.payload.rows.empty()) {
 			return;
