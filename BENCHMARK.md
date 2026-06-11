@@ -40,7 +40,7 @@ One call shreds the whole hour into typed columns (914 for this file), schema ev
 ```sql
 -- bduck rawduck.db
 .timer on
-SELECT * FROM raw_ingest_file('gh_events', 'gh.json');
+CALL raw_ingest_file('gh_events', 'gh.json');
 CHECKPOINT;
 ```
 
@@ -90,9 +90,9 @@ the table into a fresh file first (`ATTACH 'fresh.db'; CREATE TABLE fresh.t AS F
 
 ```sql
 -- after the filtered queries above, the optimizer hook has observed the predicates
-SELECT * FROM raw_stats();
-SELECT * FROM raw_optimize('gh_events');     -- physically reorders by hottest columns
-SELECT * FROM raw_project('gh_events');      -- materializes the hottest aggregation
+CALL raw_stats();
+CALL raw_optimize('gh_events');     -- physically reorders by hottest columns
+CALL raw_project('gh_events');      -- materializes the hottest aggregation
 SET rawduck_use_projections = true;          -- transparent rewrite of eligible count(*) queries
 ```
 

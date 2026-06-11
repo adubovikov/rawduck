@@ -44,7 +44,7 @@ The `ingest` schema accepts any SQL source through a fully parallel zero-copy si
 INSERT INTO raw.ingest.events SELECT json FROM read_json('events.ndjson',
     format='newline_delimited', records='false', columns={json: 'JSON'});
 
-SELECT * FROM raw_ingest_file('raw.events', 'events.ndjson.gz');   -- or the one-call file loader
+CALL raw_ingest_file('raw.events', 'events.ndjson.gz');   -- or the one-call file loader
 ```
 
 Ingest a different shape and the table follows the data: new keys become columns, conflicting
@@ -57,7 +57,9 @@ CREATE TABLE raw.daily AS SELECT date_trunc('day', ts) AS day, count(*) FROM raw
 ```
 
 For ingestion outside a RawDuck store (the default in-memory catalog, DuckLake, the async buffer),
-`raw_ingest('table', payload)` is the function-call equivalent with the same engine underneath.
+`CALL raw_ingest('table', payload)` is the equivalent with the same engine underneath. All RawDuck
+commands are table functions: invoke them with `CALL`, or use `SELECT ... FROM fn(...)` when you
+want to project or filter their result columns.
 
 ## Benchmark: one hour of GitHub, three ways
 
@@ -128,12 +130,12 @@ background flusher ingests each buffer as a single batch.
 ```sql
 SET rawduck_async_insert = true;
 
-SELECT * FROM raw_ingest('events', '[{"id": 1, "action": "click"}]');  -- returns immediately, rows = 0
-SELECT * FROM raw_ingest('events', '[{"id": 2, "action": "view"}]');
+CALL raw_ingest('events', '[{"id": 1, "action": "click"}]');  -- returns immediately, rows = 0
+CALL raw_ingest('events', '[{"id": 2, "action": "view"}]');
 
 -- a buffer flushes when it exceeds the size threshold or its oldest entry exceeds the age
 -- threshold; force it when you need the data now:
-SELECT * FROM raw_flush();
+CALL raw_flush();
 -- ┌─────────┬──────┐
 -- │ targets │ rows │
 -- │       1 │    2 │
@@ -165,8 +167,8 @@ Semantics to know before enabling it:
 RawDuck can serve an in-process HTTP API for ingestion and querying
 
 ```sql
-SELECT * FROM raw_serve(host := '127.0.0.1', port := 9999, token := 'rt_secret');
-SELECT * FROM raw_serve_stop();
+CALL raw_serve(host := '127.0.0.1', port := 9999, token := 'rt_secret');
+CALL raw_serve_stop();
 ```
 
 ```sh
@@ -213,8 +215,8 @@ Builds made with `make release RAWDUCK_ENABLE_GRPC=1` (see Building) also serve 
 OpenTelemetry collector services natively:
 
 ```sql
-SELECT * FROM raw_serve_grpc(port := 4317, token := 'rt_secret');   -- TraceService/LogsService/MetricsService
-SELECT * FROM raw_serve_grpc_stop();
+CALL raw_serve_grpc(port := 4317, token := 'rt_secret');   -- TraceService/LogsService/MetricsService
+CALL raw_serve_grpc_stop();
 ```
 
 ```sh
@@ -250,11 +252,11 @@ with the wrapper's fields merged into each row.
 
 ```sql
 -- {"owner":"123","logGroup":"/aws/lambda/api","logEvents":[{"id":"1","message":"started"},...]}
-SELECT * FROM raw_ingest('logs', payload, transform := 'cloudwatch-logs');
+CALL raw_ingest('logs', payload, transform := 'cloudwatch-logs');
 -- one row per log event, with owner and logGroup columns on each
 
 -- the generic form works for any envelope shape
-SELECT * FROM raw_ingest('events', payload, explode := 'batch.items');
+CALL raw_ingest('events', payload, explode := 'batch.items');
 ```
 
 Built-in transforms: `cloudwatch-logs`, `cloudtrail`, `firehose`, `otlp-traces`, `otlp-logs`,
@@ -266,7 +268,7 @@ are data, so they load from files or tables like anything else in DuckDB:
 SELECT raw_transform_define('my-batch', 'data.items');                          -- one-off
 SELECT raw_transform_define(name, explode) FROM read_json('transforms.json');   -- from a file
 SELECT raw_transform_define(name, explode) FROM raw.transform_config;           -- from a table
-SELECT * FROM raw_transforms();                                                 -- list them all
+CALL raw_transforms();                                                 -- list them all
 ```
 
 Dirty NDJSON streams can be ingested with `ignore_errors := true`; skipped lines are counted in the `errors` column.
@@ -300,15 +302,15 @@ as a summary table (RawMergeTree lightweight projections):
 SELECT count(*) FROM gh_events WHERE type = 'PushEvent';
 SELECT sum("payload.size") FROM gh_events WHERE type = 'PushEvent' AND "repo.id" > 700000000;
 
-SELECT * FROM raw_stats();
+CALL raw_stats();
 -- gh_events | type    | 2
 -- gh_events | repo.id | 1
 
-SELECT * FROM raw_optimize('gh_events');
+CALL raw_optimize('gh_events');
 -- gh_events | "type", "repo.id" | 247199
 
 SELECT type, count(*) FROM gh_events GROUP BY type;        -- observed by the advisor
-SELECT * FROM raw_project('gh_events');
+CALL raw_project('gh_events');
 -- gh_events | gh_events__proj | type | 15                 -- pre-aggregated summary table
 
 SET rawduck_use_projections = true;
@@ -330,7 +332,7 @@ schema evolution tracked in the metadata:
 
 ```sql
 ATTACH 'ducklake:metadata.ducklake' AS lake (DATA_PATH 's3://bucket/raw');
-SELECT * FROM raw_ingest('lake.main.events', payload);
+CALL raw_ingest('lake.main.events', payload);
 ```
 
 Catalogs that cannot rewrite columns with expressions (DuckLake rejects `ALTER ... USING`)
