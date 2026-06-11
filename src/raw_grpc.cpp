@@ -40,6 +40,7 @@ struct RawGrpcState {
 	string host;
 	int port = 0;
 	string token;
+	bool async = true;
 	bool running = false;
 
 	void Shutdown() {
@@ -101,6 +102,11 @@ grpc::Status ExportSignal(const grpc::ServerContext &context, const google::prot
 	}
 
 	Connection conn(*db);
+	if (GetGrpcState().async || RawAsyncEnabled(*conn.context)) {
+		auto parse_options = ResolveTransform(*conn.context, "otlp-" + signal, "");
+		RawAsyncEnqueue(*conn.context, table, payload, parse_options);
+		return grpc::Status::OK;
+	}
 	conn.BeginTransaction();
 	try {
 		auto parse_options = ResolveTransform(*conn.context, "otlp-" + signal, "");
@@ -174,6 +180,7 @@ struct RawServeGrpcBindData : public TableFunctionData {
 	string host = "127.0.0.1";
 	int32_t port = 4317;
 	string token;
+	bool async = true;
 };
 
 struct RawServeGrpcState : public GlobalTableFunctionState {
@@ -194,6 +201,10 @@ static unique_ptr<FunctionData> RawServeGrpcBind(ClientContext &context, TableFu
 	auto token = input.named_parameters.find("token");
 	if (token != input.named_parameters.end() && !token->second.IsNull()) {
 		result->token = token->second.GetValue<string>();
+	}
+	auto async = input.named_parameters.find("async");
+	if (async != input.named_parameters.end() && !async->second.IsNull()) {
+		result->async = async->second.GetValue<bool>();
 	}
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::BOOLEAN};
 	names = {"host", "port", "auth"};
@@ -227,6 +238,7 @@ static void RawServeGrpcFunction(ClientContext &context, TableFunctionInput &dat
 	grpc_state.db = context.db;
 	grpc_state.host = bind_data.host;
 	grpc_state.token = bind_data.token;
+	grpc_state.async = bind_data.async;
 
 	auto traces = make_shared_ptr<RawTraceService>();
 	auto logs = make_shared_ptr<RawLogsService>();
@@ -286,6 +298,7 @@ TableFunction GetRawServeGrpcFunction() {
 	function.named_parameters["host"] = LogicalType::VARCHAR;
 	function.named_parameters["port"] = LogicalType::INTEGER;
 	function.named_parameters["token"] = LogicalType::VARCHAR;
+	function.named_parameters["async"] = LogicalType::BOOLEAN;
 	return function;
 }
 

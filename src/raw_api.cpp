@@ -36,6 +36,7 @@ struct RawApiServer {
 	string host;
 	int port = 0;
 	string token;
+	bool async = true;
 	bool running = false;
 
 	// stop the listener and join the thread; safe to call repeatedly
@@ -164,6 +165,28 @@ void HandleIngest(const duckdb_httplib::Request &req, duckdb_httplib::Response &
 		return;
 	}
 	Connection conn(*db);
+	{
+		// async mode (rawduck_async_insert): enqueue and acknowledge, exactly
+		// like SQL-level ingestion - the scaling answer for many concurrent
+		// small-insert clients (batched commits, single-threaded evolution)
+		auto options = otlp_signal.empty() ? RequestParseOptions(*conn.context, req)
+		                                   : ResolveTransform(*conn.context, "otlp-" + otlp_signal, "");
+		if (GetApiServer().async || RawAsyncEnabled(*conn.context)) {
+			RawAsyncEnqueue(*conn.context, table, req.body, options);
+			JsonDoc json;
+			auto root = duckdb_yyjson::yyjson_mut_obj(json.doc);
+			if (!otlp_signal.empty()) {
+				duckdb_yyjson::yyjson_mut_obj_add_val(json.doc, root, "partialSuccess",
+				                                      duckdb_yyjson::yyjson_mut_obj(json.doc));
+				Respond(res, 200, json, root);
+			} else {
+				duckdb_yyjson::yyjson_mut_obj_add_strncpy(json.doc, root, "table", table.c_str(), table.size());
+				duckdb_yyjson::yyjson_mut_obj_add_bool(json.doc, root, "queued", true);
+				Respond(res, 202, json, root);
+			}
+			return;
+		}
+	}
 	conn.BeginTransaction();
 	try {
 		auto options = otlp_signal.empty() ? RequestParseOptions(*conn.context, req)
@@ -400,6 +423,9 @@ struct RawServeBindData : public TableFunctionData {
 	string host = "127.0.0.1";
 	int32_t port = 9999;
 	string token;
+	// the service defaults to asynchronous ingestion: concurrent clients get
+	// batched commits and serialized schema evolution (no conflicts)
+	bool async = true;
 };
 
 struct RawServeState : public GlobalTableFunctionState {
@@ -420,6 +446,10 @@ static unique_ptr<FunctionData> RawServeBind(ClientContext &context, TableFuncti
 	auto token = input.named_parameters.find("token");
 	if (token != input.named_parameters.end() && !token->second.IsNull()) {
 		result->token = token->second.GetValue<string>();
+	}
+	auto async = input.named_parameters.find("async");
+	if (async != input.named_parameters.end() && !async->second.IsNull()) {
+		result->async = async->second.GetValue<bool>();
 	}
 	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::BOOLEAN};
 	names = {"host", "port", "auth"};
@@ -449,6 +479,7 @@ static void RawServeFunction(ClientContext &context, TableFunctionInput &data, D
 	api.host = bind_data.host;
 	api.port = bind_data.port;
 	api.token = bind_data.token;
+	api.async = bind_data.async;
 	api.server = make_uniq<duckdb_httplib::Server>();
 	RegisterRoutes(*api.server);
 	if (!api.server->bind_to_port(bind_data.host.c_str(), bind_data.port)) {
@@ -493,6 +524,7 @@ TableFunction GetRawServeFunction() {
 	function.named_parameters["host"] = LogicalType::VARCHAR;
 	function.named_parameters["port"] = LogicalType::INTEGER;
 	function.named_parameters["token"] = LogicalType::VARCHAR;
+	function.named_parameters["async"] = LogicalType::BOOLEAN;
 	return function;
 }
 

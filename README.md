@@ -108,8 +108,17 @@ exceeds `rawduck_async_max_data_size` (default 1 MB) or its oldest entry exceeds
 `rawduck_async_busy_timeout_ms` (default 200 ms). `raw_flush()` drains synchronously. Semantics
 match fire-and-forget async inserts: enqueued payloads commit in the flusher's own transactions
 (outside the caller's), a failed background flush drops that batch, and buffers still inside the
-timeout window when the database closes are dropped — call `raw_flush()` before closing. The HTTP
-and gRPC endpoints always ingest synchronously (each request is its own transaction).
+timeout window when the database closes are dropped — call `raw_flush()` before closing.
+
+The HTTP and gRPC endpoints honor the same setting (set it as the database default):
+with async enabled, ingest requests enqueue and acknowledge immediately (`202` with
+`{"queued": true}` on the table routes; standard OTLP success responses on the telemetry routes).
+For many concurrent small-insert clients this batches commits and serializes schema evolution
+through one flusher instead of racing across per-request transactions — which is why **the HTTP
+and gRPC servers default to asynchronous ingestion** (`raw_serve(async := false)` /
+`raw_serve_grpc(async := false)` restore per-request synchronous transactions). SQL-level
+`raw_ingest` stays synchronous by default, like ClickHouse's `async_insert = 0`: interactive use
+expects read-your-writes.
 
 ## HTTP API
 
