@@ -51,8 +51,13 @@ release`; test with `./build/release/test/unittest --test-dir . "test/sql/*"`; f
    (`OptimisticDataWriter`, per-worker `RowGroupCollection`). Anything touching `ClientContext`,
    the catalog, or `LocalAppend`/`LocalMerge` happens on the executing thread.
 
-4. **The append pool's schema is frozen.** `RawAppendPool` must `Drain()` (merge + stop) before
-   any DDL. `RawIngestor::IngestNative` checks `NeedsDDL()` first — keep that ordering.
+4. **Pool evolution is drain-free and barrier-free.** The consumer publishes new columns to an
+   append-only list; each worker pads its own collection to the published prefix via
+   `RowGroupCollection::AddColumn` (metadata-only NULL columns). Worker layouts must remain a
+   prefix of the table layout (merges are positional); flush writers must be rebuilt against the
+   CURRENT storage at drain (compression metadata and per-column partial block managers must match
+   the evolved layout); the merge target must be the current catalog entry (ALTER swaps the
+   storage object). Only type widening drains the pool.
 
 5. **Extraction is row-major.** Each row's JSON tree is traversed once and values are routed to
    column slots via schema-tree node identity (`RawExtractor`). Do not reintroduce per-column path
