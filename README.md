@@ -82,15 +82,16 @@ Same machine (Apple Silicon, DuckDB v1.5.3), best of 3:
 
 | | JSON column | RawDuck |
 |---|---:|---:|
-| ingest (full hour, 956 MB) | 1.4 s | **9.8 s** |
+| ingest (full hour, 956 MB) | 1.4 s | **~6 s** |
 | storage on disk | 1.05 GB | **627 MB** |
 
-Ingest runs at ~25,000 events/s (~98 MB/s), with parsing pipelined on a background thread — a one-time cost within an order of magnitude of
-loading opaque JSON strings, in exchange for every later query being 45–265× faster and the data
-40% smaller on disk.
+Ingestion is fully parallel (zero-copy parse from source vectors, multi-threaded appends,
+drain-free schema evolution): the pipeline sustains **~6.1M rows/s** on narrow JSON and lands the
+heterogeneous 956 MB hour in ~6 s — a one-time cost a few times that of loading opaque JSON
+strings, in exchange for every later query being 45–265× faster and the data 40% smaller on disk.
 
 ```sql
-SELECT * FROM raw_ingest_file('gh_events', '/data/2024-01-15-10.json.gz');   -- 9.8s, 914 columns
+INSERT INTO raw.ingest.gh_events SELECT json::VARCHAR FROM read_json(...);  -- ~6s, 914 columns
 
 SELECT type, count(*) FROM gh_events GROUP BY type ORDER BY 2 DESC;          -- 1 ms
 SELECT "repo.name", count(*) AS pushes FROM gh_events
