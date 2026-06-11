@@ -977,6 +977,33 @@ RawIngestStats RawIngestPayload(ClientContext &context, const string &target, co
 	return stats;
 }
 
+// Streaming handle over RawIngestor for the INSERT-syntax path
+namespace {
+class RawStreamIngestorImpl : public RawStreamIngestor {
+public:
+	RawStreamIngestorImpl(ClientContext &context, const string &target, RawParseOptions options)
+	    : ingestor(context, target, std::move(options)) {
+	}
+	void Ingest(const string &payload) override {
+		ingestor.Ingest(payload);
+	}
+	void Finish() override {
+		ingestor.Finish();
+	}
+	idx_t Rows() const override {
+		return ingestor.rows;
+	}
+
+private:
+	RawIngestor ingestor;
+};
+} // namespace
+
+unique_ptr<RawStreamIngestor> RawCreateStreamIngestor(ClientContext &context, const string &target,
+                                                      RawParseOptions options) {
+	return make_uniq<RawStreamIngestorImpl>(context, target, std::move(options));
+}
+
 //===--------------------------------------------------------------------===//
 // raw_ingest(table, payload)
 //===--------------------------------------------------------------------===//

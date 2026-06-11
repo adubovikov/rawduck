@@ -44,6 +44,26 @@ TableFunction GetRawFlushFunction();
 bool RawAsyncEnabled(ClientContext &context);
 void RawAsyncEnqueue(ClientContext &context, const string &target, string payload, RawParseOptions options);
 
+// streaming ingestion handle (INSERT-syntax path)
+class RawStreamIngestor {
+public:
+	virtual ~RawStreamIngestor() = default;
+	virtual void Ingest(const string &payload) = 0;
+	virtual void Finish() = 0;
+	virtual idx_t Rows() const = 0;
+};
+unique_ptr<RawStreamIngestor> RawCreateStreamIngestor(ClientContext &context, const string &target,
+                                                      RawParseOptions options);
+class SchemaCatalogEntry;
+class TableCatalogEntry;
+class PhysicalPlanGenerator;
+class LogicalInsert;
+class PhysicalOperator;
+unique_ptr<SchemaCatalogEntry> RawCreateIngestSchema(Catalog &catalog);
+bool RawIsIngestTable(const TableCatalogEntry &table);
+PhysicalOperator &RawPlanIngestInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
+                                      optional_ptr<PhysicalOperator> plan);
+
 // shared SQL generation helpers
 string RawQuoteIdentifier(const string &name);
 string RawQualifiedTarget(const string &target);

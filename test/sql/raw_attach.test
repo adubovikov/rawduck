@@ -117,3 +117,40 @@ query I
 SELECT filter_count >= 2 FROM raw_stats() WHERE "table" = 'raw2.main.events' AND "column" = 'id';
 ----
 true
+
+#===----------------------------------------------------------------------===#
+# INSERT-syntax ingestion through the virtual ingest schema
+#===----------------------------------------------------------------------===#
+
+statement ok
+INSERT INTO raw2.ingest.clicks VALUES ('{"id":1,"page":"/a"}'), ('{"id":2,"page":"/b","ms":1.5}');
+
+query III
+SELECT id, page, ms FROM raw2.clicks ORDER BY id;
+----
+1	/a	NULL
+2	/b	1.5
+
+# arrays and evolution through INSERT
+statement ok
+INSERT INTO raw2.ingest.clicks VALUES ('[{"id":3,"tags":["x","y"]}]');
+
+query II
+SELECT count(*), count(tags) FROM raw2.clicks;
+----
+3	1
+
+# INSERT .. SELECT streams through the same path
+statement ok
+INSERT INTO raw2.ingest.clicks SELECT '{"id":' || range || '}' FROM range(4, 10);
+
+query I
+SELECT count(*) FROM raw2.clicks;
+----
+9
+
+# ingest tables are write-only
+statement error
+SELECT * FROM raw2.ingest.clicks;
+----
+<REGEX>:.*write-only.*

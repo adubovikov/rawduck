@@ -44,6 +44,16 @@ UPDATE raw.events SET "user.plan" = 'enterprise' WHERE id = 1;
 CREATE TABLE raw.daily AS SELECT date_trunc('day', ts) AS day, count(*) FROM raw.events GROUP BY 1;
 ```
 
+Inside a RawDuck store, plain `INSERT` works too — the virtual `ingest` schema accepts raw JSON
+payloads and streams them into the real table of the same name, auto-creation and evolution
+included:
+
+```sql
+INSERT INTO raw.ingest.events VALUES ('{"id": 3, "action": "buy", "amount": 99.5}');
+INSERT INTO raw.ingest.events SELECT json FROM read_json('events.ndjson',
+    format='newline_delimited', records='false', columns={json: 'JSON'});
+```
+
 Ingest again with a different shape and the table follows the data: new keys become columns,
 conflicting types widen, missing keys read as `NULL` — nothing is ever dropped.
 
