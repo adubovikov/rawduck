@@ -141,14 +141,14 @@ public:
 
 class RawIngestLocalSinkState : public LocalSinkState {
 public:
-	// consecutive single-object payloads coalesce into NDJSON batches
-	string buffer;
-	idx_t buffered = 0;
+	// zero-copy: documents parse straight from the source vector's memory
+	// into this thread-local payload, finalized once per batch
+	shared_ptr<RawParsedPayload> building;
 };
 
 class PhysicalRawIngest : public PhysicalOperator {
 public:
-	static constexpr idx_t BATCH_BYTES = 8ULL * 1024ULL * 1024ULL;
+	static constexpr idx_t BATCH_ROWS = 30000;
 
 	PhysicalRawIngest(PhysicalPlan &plan, string target_p, idx_t estimated_cardinality)
 	    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, {LogicalType::BIGINT}, estimated_cardinality),
@@ -183,6 +183,9 @@ public:
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
 		auto &gstate = input.global_state.Cast<RawIngestSinkState>();
 		auto &state = input.local_state.Cast<RawIngestLocalSinkState>();
+		if (!state.building) {
+			state.building = make_shared_ptr<RawParsedPayload>();
+		}
 		UnifiedVectorFormat payloads;
 		chunk.data[0].ToUnifiedFormat(chunk.size(), payloads);
 		auto strings = UnifiedVectorFormat::GetData<string_t>(payloads);
@@ -192,25 +195,11 @@ public:
 				continue;
 			}
 			auto payload = strings[idx];
-			auto data = payload.GetData();
-			auto size = payload.GetSize();
-			idx_t first = 0;
-			while (first < size && StringUtil::CharacterIsSpace(data[first])) {
-				first++;
-			}
-			if (first < size && data[first] == '{') {
-				// single objects coalesce into one NDJSON batch
-				state.buffer.append(data, size);
-				state.buffer.push_back('\n');
-				state.buffered++;
-				if (state.buffer.size() >= BATCH_BYTES) {
-					FlushBuffer(gstate, state);
-				}
-			} else {
-				// arrays / NDJSON payloads ingest standalone
-				FlushBuffer(gstate, state);
-				gstate.ingestor->IngestConcurrent(string(data, size));
-			}
+			// objects and arrays both expand into rows here; no copies
+			RawPayloadAddDocument(*state.building, payload.GetData(), payload.GetSize());
+		}
+		if (state.building->payload.rows.size() >= BATCH_ROWS) {
+			FlushBuilding(gstate, state);
 		}
 		return SinkResultType::NEED_MORE_INPUT;
 	}
@@ -218,7 +207,7 @@ public:
 	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override {
 		auto &gstate = input.global_state.Cast<RawIngestSinkState>();
 		auto &state = input.local_state.Cast<RawIngestLocalSinkState>();
-		FlushBuffer(gstate, state);
+		FlushBuilding(gstate, state);
 		return SinkCombineResultType::FINISHED;
 	}
 
@@ -238,13 +227,16 @@ public:
 	}
 
 private:
-	static void FlushBuffer(RawIngestSinkState &gstate, RawIngestLocalSinkState &state) {
-		if (state.buffered == 0) {
+	static void FlushBuilding(RawIngestSinkState &gstate, RawIngestLocalSinkState &state) {
+		if (!state.building || state.building->payload.rows.empty()) {
+			if (state.building) {
+				state.building.reset();
+			}
 			return;
 		}
-		gstate.ingestor->IngestConcurrent(state.buffer);
-		state.buffer.clear();
-		state.buffered = 0;
+		RawPayloadFinalize(*state.building);
+		gstate.ingestor->IngestParsedConcurrent(std::move(state.building));
+		state.building.reset();
 	}
 
 	string target;

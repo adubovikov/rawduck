@@ -89,6 +89,12 @@ struct RawParsedPayload {
 	                                            const RawParseOptions &options = RawParseOptions());
 };
 
+// Incremental payload assembly (zero-copy INSERT sink): parse documents one
+// at a time straight from source memory, then finalize (uniformity check +
+// inference + flattening) once per batch.
+void RawPayloadAddDocument(RawParsedPayload &payload, const char *data, idx_t size, bool ignore_errors = false);
+void RawPayloadFinalize(RawParsedPayload &payload);
+
 // Built-in ingest-time transforms (name -> dotted explode path); users can
 // register additional ones via raw_transform_define().
 const vector<pair<string, string>> &RawBuiltinTransforms();

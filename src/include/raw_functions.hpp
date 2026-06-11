@@ -8,6 +8,7 @@ namespace duckdb {
 class OptimizerExtension;
 class StorageExtension;
 struct RawParseOptions;
+struct RawParsedPayload;
 
 TableFunction GetRawRecordsFunction();
 TableFunction GetRawIngestFunction();
@@ -49,8 +50,8 @@ class RawStreamIngestor {
 public:
 	virtual ~RawStreamIngestor() = default;
 	virtual void Ingest(const string &payload) = 0;
-	// thread-safe: parses on the calling thread, serializes only the handoff
-	virtual void IngestConcurrent(const string &payload) = 0;
+	// thread-safe: only schema work serializes; appends fan out via the pool
+	virtual void IngestParsedConcurrent(shared_ptr<RawParsedPayload> parsed) = 0;
 	virtual void Finish() = 0;
 	virtual idx_t Rows() const = 0;
 };

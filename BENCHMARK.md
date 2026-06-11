@@ -102,6 +102,21 @@ The cold numbers above include schema discovery (CREATE + evolution sync points)
 the same hour into the already-evolved table runs the pipeline fully parallel: **~4.9 s**
 (~50k events/s, ~196 MB/s) — the steady-state rate once a table's shape has stabilized.
 
+## INSERT-syntax streaming (fastest path)
+
+`INSERT INTO raw.ingest.t SELECT ...` streams any SQL source through a parallel zero-copy sink
+(per-thread parsing directly from source vectors, batched appends):
+
+```sql
+ATTACH 'rawduck:store.db' AS raw;
+INSERT INTO raw.ingest.gh_events SELECT json::VARCHAR FROM read_json('gh.json',
+    format='newline_delimited', records='false', columns={json: 'JSON'});
+-- GH hour: ~6.2 s cold / ~5.2 s warm (vs 10-12 s through the serial sink)
+
+INSERT INTO raw.ingest.narrow SELECT '{"a":' || range || '}' FROM range(5000000);
+-- 5M narrow rows in ~0.8 s  (~6.1M rows/s)
+```
+
 ## Realtime small-insert workload
 
 One-shot bulk loads don't show client behavior. To simulate real clients (1–100 events per

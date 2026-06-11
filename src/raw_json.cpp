@@ -216,6 +216,25 @@ unique_ptr<RawNode> RawPayload::InferSchema() const {
 	return root;
 }
 
+void RawPayloadAddDocument(RawParsedPayload &parsed, const char *data, idx_t size, bool ignore_errors) {
+	auto doc = duckdb_yyjson::yyjson_read(data, size, RAW_READ_FLAGS);
+	if (!doc) {
+		if (ignore_errors) {
+			parsed.payload.parse_errors++;
+			return;
+		}
+		throw InvalidInputException("RawDuck: payload is not valid JSON");
+	}
+	parsed.payload.docs.push_back(doc);
+	CollectRows(duckdb_yyjson::yyjson_doc_get_root(doc), parsed.payload.rows);
+}
+
+void RawPayloadFinalize(RawParsedPayload &parsed) {
+	CheckRowUniformity(parsed.payload.rows, parsed.payload.scalar_rows);
+	parsed.root = parsed.payload.InferSchema();
+	parsed.columns = FlattenSchema(*parsed.root, parsed.payload.scalar_rows);
+}
+
 shared_ptr<RawParsedPayload> RawParsedPayload::Process(const string &payload_text, const RawParseOptions &options) {
 	auto result = make_shared_ptr<RawParsedPayload>();
 	result->payload.Parse(payload_text, options);

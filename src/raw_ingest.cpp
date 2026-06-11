@@ -987,12 +987,11 @@ public:
 	void Ingest(const string &payload) override {
 		ingestor.Ingest(payload);
 	}
-	void IngestConcurrent(const string &payload) override {
-		// parsing and inference are pure and run on the calling thread; the
-		// schema/append handoff serializes (appends fan out via the pool)
-		auto parsed = RawParsedPayload::Process(payload, parse_options);
+	void IngestParsedConcurrent(shared_ptr<RawParsedPayload> parsed) override {
+		// parsing already happened on the calling thread; the schema/append
+		// handoff serializes and appends fan out through the pool
 		lock_guard<mutex> guard(lock);
-		ingestor.IngestParsed(std::move(parsed), payload);
+		ingestor.IngestParsed(std::move(parsed), empty_payload);
 	}
 	void Finish() override {
 		ingestor.Finish();
@@ -1003,6 +1002,7 @@ public:
 
 private:
 	RawParseOptions parse_options;
+	string empty_payload;
 	mutex lock;
 	RawIngestor ingestor;
 };
