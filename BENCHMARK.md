@@ -96,6 +96,12 @@ SELECT * FROM raw_project('gh_events');      -- materializes the hottest aggrega
 SET rawduck_use_projections = true;          -- transparent rewrite of eligible count(*) queries
 ```
 
+## Warm-table ingest
+
+The cold numbers above include schema discovery (CREATE + evolution sync points). Re-ingesting
+the same hour into the already-evolved table runs the pipeline fully parallel: **~4.9 s**
+(~50k events/s, ~196 MB/s) — the steady-state rate once a table's shape has stabilized.
+
 ## Realtime small-insert workload
 
 One-shot bulk loads don't show client behavior. To simulate real clients (1–100 events per
