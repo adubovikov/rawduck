@@ -1,7 +1,9 @@
 {
 	"name": "rawduck",
 	"version": "1.0.0",
-	"dependencies": [],
+	"dependencies": [
+		"zlib"
+	],
 	"features": {
 		"grpc": {
 			"description": "OTLP/gRPC ingestion server",

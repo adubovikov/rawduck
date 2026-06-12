@@ -164,6 +164,8 @@ void HandleIngest(const duckdb_httplib::Request &req, duckdb_httplib::Response &
 	if (!db) {
 		return;
 	}
+	// gzip request bodies are decompressed by the server layer (zlib builds)
+	auto &body = req.body;
 	Connection conn(*db);
 	{
 		// async mode (rawduck_async_insert): enqueue and acknowledge, exactly
@@ -172,7 +174,7 @@ void HandleIngest(const duckdb_httplib::Request &req, duckdb_httplib::Response &
 		auto options = otlp_signal.empty() ? RequestParseOptions(*conn.context, req)
 		                                   : ResolveTransform(*conn.context, "otlp-" + otlp_signal, "");
 		if (GetApiServer().async || RawAsyncEnabled(*conn.context)) {
-			RawAsyncEnqueue(*conn.context, table, req.body, options);
+			RawAsyncEnqueue(*conn.context, table, body, options);
 			JsonDoc json;
 			auto root = duckdb_yyjson::yyjson_mut_obj(json.doc);
 			if (!otlp_signal.empty()) {
@@ -191,7 +193,7 @@ void HandleIngest(const duckdb_httplib::Request &req, duckdb_httplib::Response &
 	try {
 		auto options = otlp_signal.empty() ? RequestParseOptions(*conn.context, req)
 		                                   : ResolveTransform(*conn.context, "otlp-" + otlp_signal, "");
-		auto stats = RawIngestPayload(*conn.context, table, req.body, options);
+		auto stats = RawIngestPayload(*conn.context, table, body, options);
 		conn.Commit();
 		JsonDoc json;
 		auto root = duckdb_yyjson::yyjson_mut_obj(json.doc);

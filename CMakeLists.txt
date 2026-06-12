@@ -17,6 +17,15 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/yyjson/includ
 # DuckDB's vendored cpp-httplib (namespace duckdb_httplib) for the API server
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/httplib)
 
+# zlib enables cpp-httplib's native gzip handling for the HTTP API
+# (request decompression and response compression)
+if(NOT EMSCRIPTEN)
+  find_package(ZLIB QUIET)
+  if(ZLIB_FOUND)
+    set_source_files_properties(src/raw_api.cpp PROPERTIES COMPILE_DEFINITIONS CPPHTTPLIB_ZLIB_SUPPORT=1)
+  endif()
+endif()
+
 # Optional OTLP/gRPC ingestion server: enabled when gRPC and protobuf are
 # available (vcpkg in CI, system packages locally). Never built for wasm.
 option(RAWDUCK_ENABLE_GRPC "Build the OTLP/gRPC ingestion server (requires gRPC + protobuf)" OFF)
@@ -94,6 +103,11 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 target_link_libraries(${EXTENSION_NAME} duckdb_yyjson)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} duckdb_yyjson)
+
+if(ZLIB_FOUND)
+  target_link_libraries(${EXTENSION_NAME} ZLIB::ZLIB)
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} ZLIB::ZLIB)
+endif()
 
 if(RAWDUCK_GRPC_ENABLED)
   target_link_libraries(${EXTENSION_NAME} gRPC::grpc++ protobuf::libprotobuf)

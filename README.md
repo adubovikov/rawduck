@@ -191,7 +191,9 @@ curl -X POST localhost:9999/v1/query -H "Authorization: Bearer rt_secret" \
 | `POST /otlp/v1/{traces,logs,metrics}` | OTLP/HTTP JSON ingest with envelope unwrapping and spec-shaped `partialSuccess` responses |
 
 Requests run on their own connections/transactions; a bearer `token` guards everything except
-`/health`; CORS is enabled for browser clients. Binds to localhost by default.
+`/health`; CORS is enabled for browser clients; gzip is supported both ways (request bodies with
+`Content-Encoding: gzip`, compressed responses for `Accept-Encoding: gzip` clients). Binds to
+localhost by default.
 
 ### OpenTelemetry SDKs
 
