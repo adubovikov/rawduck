@@ -1,5 +1,12 @@
 # Publish unsigned rawduck loadable binaries to GitHub Pages (INSTALL FROM ...)
-# and attach a linux bundle tarball (duckdb shell + extension) to GitHub Releases.
+# and attach bundle tarballs (official DuckDB CLI + extension) to GitHub Releases
+# for linux amd64 and macOS arm64.
+#
+# Only the four native platforms that actually get published are built
+# (linux/osx x amd64/arm64); wasm, musl and windows are excluded so no action
+# time is spent on binaries that are never uploaded. The bundles are packaging
+# only - they reuse the extension binaries from the build job and download the
+# official DuckDB CLI instead of rebuilding from source.
 #
 # One-time setup: repo Settings -> Pages -> Build and deployment -> Source: GitHub Actions.
 #
@@ -20,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Git tag for the linux bundle tarball (manual runs; optional)'
+        description: 'Git tag for the bundle tarballs (manual runs; optional)'
         required: false
         type: string
       skip_pages:
@@ -29,7 +36,7 @@ on:
         default: false
         type: boolean
       skip_tarball:
-        description: 'Skip linux bundle tarball upload'
+        description: 'Skip bundle tarball upload'
         required: false
         default: false
         type: boolean
@@ -41,7 +48,6 @@ concurrency:
 env:
   EXT_NAME: rawduck
   DUCKDB_VERSION: v1.5.3
-  RELEASE_ASSET: rawduck-linux-amd64
   PAGES_BASE_URL: https://quackscience.github.io/rawduck
 
 jobs:
@@ -52,7 +58,11 @@ jobs:
       duckdb_version: v1.5.3
       ci_tools_version: v1.5-variegata
       extension_name: rawduck
-      exclude_archs: 'windows_amd64;windows_arm64;windows_amd64_mingw;windows_amd64_rtools'
+      # build exactly the four published platforms: linux/osx x amd64/arm64.
+      # windows stays excluded for the VS2026/fmt incompatibility (see
+      # MainDistributionPipeline.yml); wasm and musl are excluded because the
+      # release never uploads them.
+      exclude_archs: 'windows_amd64;windows_arm64;windows_amd64_mingw;windows_amd64_rtools;wasm_mvp;wasm_eh;wasm_threads;linux_amd64_musl;linux_arm64_musl'
 
   package-pages:
     name: Package extension repository
@@ -138,48 +148,60 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@v4
 
-  build-linux-bundle:
-    name: Build linux amd64 bundle tarball
+  bundle:
+    name: Bundle tarball (${{ matrix.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    needs: build
     if: >-
       (github.event_name == 'release') ||
       (github.event_name == 'workflow_dispatch' && inputs.skip_tarball != true && inputs.release_tag != '')
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            duckdb_arch: linux_amd64
+            cli_asset: duckdb_cli-linux-amd64.zip
+          - name: macos-arm64
+            duckdb_arch: osx_arm64
+            cli_asset: duckdb_cli-osx-universal.zip
     env:
       RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+      RELEASE_ASSET: rawduck-${{ matrix.name }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Download extension artifact
+        uses: actions/download-artifact@v4
         with:
-          ref: ${{ github.event.release.tag_name || inputs.release_tag || github.ref }}
-          submodules: recursive
+          name: ${{ env.EXT_NAME }}-${{ env.DUCKDB_VERSION }}-extension-${{ matrix.duckdb_arch }}
+          path: artifacts
 
-      - name: Pin DuckDB ${{ env.DUCKDB_VERSION }}
+      - name: Download official DuckDB CLI
         run: |
-          cd duckdb
-          git fetch --tags --depth 1 origin tag ${{ env.DUCKDB_VERSION }}
-          git checkout ${{ env.DUCKDB_VERSION }}
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build ccache zlib1g-dev
-
-      - name: Build DuckDB + rawduck
-        run: GEN=ninja make release
+          set -euo pipefail
+          curl -fsSL -o cli.zip \
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/${{ matrix.cli_asset }}"
+          unzip -o cli.zip -d cli
 
       - name: Package release tarball
         run: |
-          mkdir -p "dist/${RELEASE_ASSET}"
-          cp build/release/duckdb "dist/${RELEASE_ASSET}/"
-          mkdir -p "dist/${RELEASE_ASSET}/extension/rawduck"
-          cp build/release/extension/rawduck/rawduck.duckdb_extension \
-            "dist/${RELEASE_ASSET}/extension/rawduck/"
+          set -euo pipefail
+          mkdir -p "dist/${RELEASE_ASSET}/extension/${EXT_NAME}"
+          cp cli/duckdb "dist/${RELEASE_ASSET}/duckdb"
+          chmod +x "dist/${RELEASE_ASSET}/duckdb"
+          cp "artifacts/${EXT_NAME}.duckdb_extension" "dist/${RELEASE_ASSET}/extension/${EXT_NAME}/"
+          cat > "dist/${RELEASE_ASSET}/rawduck" <<'SCRIPT'
+          #!/bin/sh
+          # DuckDB shell with the unsigned rawduck extension preloaded
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          exec "$DIR/duckdb" -unsigned -cmd "LOAD '$DIR/extension/rawduck/rawduck.duckdb_extension';" "$@"
+          SCRIPT
+          chmod +x "dist/${RELEASE_ASSET}/rawduck"
           {
             echo "tag=${RELEASE_TAG}"
-            echo "duckdb=${{ env.DUCKDB_VERSION }}"
+            echo "duckdb=${DUCKDB_VERSION}"
             echo "commit=${{ github.sha }}"
           } > "dist/${RELEASE_ASSET}/VERSION"
           tar -czf "dist/${RELEASE_ASSET}-${RELEASE_TAG}.tar.gz" -C dist "${RELEASE_ASSET}"
