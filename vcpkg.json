@@ -4,7 +4,19 @@
 	"dependencies": [
 		"zlib"
 	],
+	"default-features": [
+		"protobuf"
+	],
 	"features": {
+		"protobuf": {
+			"description": "OTLP/protobuf request bodies on the HTTP API",
+			"dependencies": [
+				{
+					"name": "protobuf",
+					"platform": "!emscripten & !mingw"
+				}
+			]
+		},
 		"grpc": {
 			"description": "OTLP/gRPC ingestion server",
 			"dependencies": [

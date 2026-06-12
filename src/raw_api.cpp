@@ -20,7 +20,8 @@ namespace duckdb {
 //   GET    /v1/tables/{table}          describe schema
 //   POST   /v1/tables/{table}          schema-less ingest (?transform=&explode=&ignore_errors=)
 //   DELETE /v1/tables/{table}          drop table
-//   POST   /otlp/v1/{traces|logs|metrics}   OTLP/JSON ingest (x-rawduck-table header routes)
+//   POST   /otlp/v1/{traces|logs|metrics}   OTLP ingest, JSON or protobuf body
+//                                           (x-rawduck-table header routes)
 //
 // Server lifecycle is owned by a background thread; every request gets its
 // own Connection (and so its own transaction) against the database instance.
@@ -222,6 +223,54 @@ void HandleIngest(const duckdb_httplib::Request &req, duckdb_httplib::Response &
 	}
 }
 
+// OTLP/HTTP protobuf requests answer with protobuf bodies: an
+// Export*ServiceResponse on success, a google.rpc.Status on failure
+void RespondOtlpStatus(duckdb_httplib::Response &res, int status, const string &message) {
+	res.status = status;
+	res.set_content(RawOtlpStatusBytes(message), "application/x-protobuf");
+}
+
+void HandleOtlpProtobuf(const duckdb_httplib::Request &req, duckdb_httplib::Response &res, const string &table,
+                        const string &signal) {
+	if (!RawOtlpProtobufSupported()) {
+		RespondError(res, 415,
+		             "this build does not include OTLP/protobuf support; configure the SDK with "
+		             "OTEL_EXPORTER_OTLP_PROTOCOL=http/json or use a build with the protobuf feature");
+		return;
+	}
+	auto db = RequireDatabase(res);
+	if (!db) {
+		return;
+	}
+	// decode through the same protobuf -> JSON conversion the gRPC server
+	// uses, then ingest exactly like an OTLP/JSON request
+	string payload, error;
+	if (!RawOtlpProtobufToJson(signal, req.body, payload, error)) {
+		RespondOtlpStatus(res, 400, error);
+		return;
+	}
+	Connection conn(*db);
+	auto options = ResolveTransform(*conn.context, "otlp-" + signal, "");
+	if (GetApiServer().async || RawAsyncEnabled(*conn.context)) {
+		RawAsyncEnqueue(*conn.context, table, std::move(payload), options);
+		res.status = 200;
+		res.set_content(RawOtlpProtobufResponse(signal, 0, ""), "application/x-protobuf");
+		return;
+	}
+	conn.BeginTransaction();
+	try {
+		auto stats = RawIngestPayload(*conn.context, table, payload, options);
+		conn.Commit();
+		res.status = 200;
+		res.set_content(
+		    RawOtlpProtobufResponse(signal, stats.errors, stats.errors ? "some records could not be parsed" : ""),
+		    "application/x-protobuf");
+	} catch (std::exception &ex) {
+		conn.Rollback();
+		RespondOtlpStatus(res, 400, ErrorData(ex).RawMessage());
+	}
+}
+
 void HandleQuery(const duckdb_httplib::Request &req, duckdb_httplib::Response &res) {
 	auto db = RequireDatabase(res);
 	if (!db) {
@@ -413,13 +462,6 @@ void RegisterRoutes(duckdb_httplib::Server &server) {
 		            if (!Authorized(req, res)) {
 			            return;
 		            }
-		            if (req.get_header_value("Content-Type").find("protobuf") != string::npos) {
-			            RespondError(res, 415,
-			                         "OTLP/protobuf is not supported; configure the SDK with "
-			                         "OTEL_EXPORTER_OTLP_PROTOCOL=http/json (for OTLP/gRPC SDKs, bridge through an "
-			                         "OpenTelemetry Collector)");
-			            return;
-		            }
 		            string signal = req.matches.groups[1].text;
 		            // signal-specific table header, generic header, then default
 		            auto table = req.get_header_value("x-rawduck-" + signal + "-table");
@@ -428,6 +470,10 @@ void RegisterRoutes(duckdb_httplib::Server &server) {
 		            }
 		            if (table.empty()) {
 			            table = "otel_" + signal;
+		            }
+		            if (req.get_header_value("Content-Type").find("protobuf") != string::npos) {
+			            HandleOtlpProtobuf(req, res, table, signal);
+			            return;
 		            }
 		            HandleIngest(req, res, table, signal);
 	            });

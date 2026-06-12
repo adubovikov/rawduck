@@ -29,6 +29,8 @@ release`; test with `./build/release/test/unittest --test-dir . "test/sql/*"`; f
 | `raw_scalars.cpp` | `raw_type()`, `raw_infer()`. |
 | `raw_async.cpp` | Opt-in async inserts: per-table buffers + background flusher owned by an `ObjectCache` entry (joins on teardown; `weak_ptr` database guard; fire-and-forget semantics — `raw_flush()` is the synchronous drain). |
 | `raw_api.cpp` | `raw_serve()` / `raw_serve_stop()`: in-process HTTP API on DuckDB's vendored `duckdb_httplib`. |
+| `raw_otlp_pb.cpp` | OTLP/HTTP protobuf bodies: `Export*ServiceRequest` → `MessageToJsonString` → the regular OTLP/JSON ingestion path; protobuf `Export*ServiceResponse` / hand-encoded `google.rpc.Status` replies. Compiles to graceful stubs (HTTP 415) without protobuf (`RAWDUCK_WITH_OTLP_PROTOBUF` unset: wasm, `RAWDUCK_DISABLE_OTLP_PROTOBUF=1`). |
+| `raw_grpc.cpp` | Opt-in OTLP/gRPC collector (`RAWDUCK_ENABLE_GRPC=1` builds; `RAWDUCK_WITH_GRPC`); shares the protobuf→JSON conversion approach and ingestion path with `raw_otlp_pb.cpp`. |
 
 ## Design invariants — do not break these
 
@@ -108,12 +110,18 @@ release`; test with `./build/release/test/unittest --test-dir . "test/sql/*"`; f
 - `ObjectCacheEntry` subclasses must implement `GetEstimatedCacheMemory()` (return invalid
   `optional_idx` to forbid eviction).
 - Table function args bind as constants — no subqueries/prepared params as arguments.
+- **OTLP transport parity is deliberate**: protobuf's generic JSON conversion deviates from the
+  OTLP/JSON mapping in two places — bytes ids (`traceId`/`spanId`) come out base64 (spec says hex)
+  and enums come out as names (spec says integers). Fixed by base64→hex conversion in the otlp
+  semantic normalization (`raw_json.cpp`, covers gRPC + HTTP-protobuf) and
+  `JsonPrintOptions::always_print_enums_as_ints` at both decode sites. All transports must keep
+  producing byte-identical columns or mixed exporter fleets fork column types.
 
 ## Testing conventions
 
 sqllogictests in `test/sql/`: `rawduck.test` (core types/records), `raw_ingest.test` (evolution),
 `raw_advanced.test` (streaming, transforms, pool, optimize, projections), `raw_attach.test`
-(stores, transactions, persistence), `raw_api.test` (server lifecycle), `ducklake.test``ducklake.test` (`require ducklake`, skips when absent).
+(stores, transactions, persistence), `raw_api.test` (server lifecycle), `ducklake.test` (`require ducklake`, skips when absent).
 Every feature needs: happy path, evolution interaction, error case, and—for anything that can
 return wrong data—a proof test (e.g. tampering with a projection to prove the rewrite engaged).
 `raw_ingest` output is `(table, created, columns_added, columns_widened, rows, errors)`;
@@ -126,3 +134,5 @@ return wrong data—a proof test (e.g. tampering with a projection to prove the 
 - Missing payload keys insert `NULL`, not column defaults.
 - Projection rewriting doesn't detect in-place UPDATEs of group columns (token is row-count based).
 - Generated columns and indexed/constrained tables use the serial append path.
+- Builds without protobuf (wasm, `RAWDUCK_DISABLE_OTLP_PROTOBUF=1`) answer OTLP/HTTP protobuf
+  bodies with a 415 pointing at `http/json`; everything else is unaffected.

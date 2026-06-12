@@ -195,7 +195,85 @@ static void ExplodeInto(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjson::yyjso
 // - AnyValue wrappers unwrap: {"stringValue": s} -> s, {"intValue": "1"} -> 1,
 //   arrayValue/kvlistValue recurse
 // - all-digit *UnixNano strings become integers
+// - traceId/spanId/parentSpanId base64 strings become lowercase hex: the
+//   OTLP/JSON mapping requires hex for these two bytes fields, but protobuf's
+//   generic JSON conversion (the gRPC and OTLP/HTTP-protobuf decode paths)
+//   emits base64
 //===--------------------------------------------------------------------===//
+
+static bool OtlpIsHex(const char *str, size_t len) {
+	for (size_t i = 0; i < len; i++) {
+		auto c = str[i];
+		if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// strict standard base64 (padded), as produced by protobuf's JSON conversion
+static bool OtlpBase64Decode(const char *str, size_t len, string &out) {
+	if (len == 0 || len % 4 != 0) {
+		return false;
+	}
+	auto decode = [](char c) -> int {
+		if (c >= 'A' && c <= 'Z') {
+			return c - 'A';
+		}
+		if (c >= 'a' && c <= 'z') {
+			return c - 'a' + 26;
+		}
+		if (c >= '0' && c <= '9') {
+			return c - '0' + 52;
+		}
+		if (c == '+') {
+			return 62;
+		}
+		if (c == '/') {
+			return 63;
+		}
+		return -1;
+	};
+	size_t padding = str[len - 1] == '=' ? (str[len - 2] == '=' ? 2 : 1) : 0;
+	out.reserve(len / 4 * 3 - padding);
+	for (size_t i = 0; i < len; i += 4) {
+		int values[4];
+		for (size_t j = 0; j < 4; j++) {
+			auto c = str[i + j];
+			if (c == '=') {
+				// padding is only valid at the very end
+				if (i + 4 != len || j < 4 - padding) {
+					return false;
+				}
+				values[j] = 0;
+				continue;
+			}
+			values[j] = decode(c);
+			if (values[j] < 0) {
+				return false;
+			}
+		}
+		out.push_back(static_cast<char>((values[0] << 2) | (values[1] >> 4)));
+		if (i + 4 != len || padding < 2) {
+			out.push_back(static_cast<char>((values[1] << 4) | (values[2] >> 2)));
+		}
+		if (i + 4 != len || padding < 1) {
+			out.push_back(static_cast<char>((values[2] << 6) | values[3]));
+		}
+	}
+	return true;
+}
+
+// returns the expected decoded byte width for OTLP id fields, 0 otherwise
+static size_t OtlpIdWidth(const char *key, size_t key_len) {
+	if (key_len == 7 && memcmp(key, "traceId", 7) == 0) {
+		return 16;
+	}
+	if ((key_len == 6 && memcmp(key, "spanId", 6) == 0) || (key_len == 12 && memcmp(key, "parentSpanId", 12) == 0)) {
+		return 8;
+	}
+	return 0;
+}
 
 static duckdb_yyjson::yyjson_mut_val *OtlpNormalizeValue(duckdb_yyjson::yyjson_mut_doc *doc,
                                                          duckdb_yyjson::yyjson_mut_val *value, const char *key,
@@ -330,6 +408,27 @@ static duckdb_yyjson::yyjson_mut_val *OtlpNormalizeValue(duckdb_yyjson::yyjson_m
 		for (auto element : originals) {
 			auto normalized = OtlpNormalizeValue(doc, element, "", 0, depth + 1);
 			duckdb_yyjson::yyjson_mut_arr_append(value, normalized ? normalized : element);
+		}
+		return value;
+	}
+	// protobuf JSON conversion emits bytes id fields as base64; OTLP/JSON
+	// mandates hex, so normalize (already-hex values pass through untouched)
+	auto id_width = duckdb_yyjson::yyjson_mut_is_str(value) ? OtlpIdWidth(key, key_len) : 0;
+	if (id_width) {
+		auto str = duckdb_yyjson::yyjson_mut_get_str(value);
+		auto len = duckdb_yyjson::yyjson_mut_get_len(value);
+		if (!(len == id_width * 2 && OtlpIsHex(str, len))) {
+			string decoded;
+			if (OtlpBase64Decode(str, len, decoded) && decoded.size() == id_width) {
+				static const char *hex_digits = "0123456789abcdef";
+				string hex;
+				hex.reserve(decoded.size() * 2);
+				for (auto byte : decoded) {
+					hex.push_back(hex_digits[(static_cast<unsigned char>(byte) >> 4) & 0xF]);
+					hex.push_back(hex_digits[static_cast<unsigned char>(byte) & 0xF]);
+				}
+				return duckdb_yyjson::yyjson_mut_strncpy(doc, hex.c_str(), hex.size());
+			}
 		}
 		return value;
 	}

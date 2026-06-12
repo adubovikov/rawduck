@@ -188,7 +188,7 @@ curl -X POST localhost:9999/v1/query -H "Authorization: Bearer rt_secret" \
 | `GET /v1/tables`, `GET /v1/tables/{t}` | list tables / describe schema |
 | `POST /v1/tables/{t}` | schema-less ingest (`?transform=`, `?explode=`, `?ignore_errors=true`) |
 | `DELETE /v1/tables/{t}` | drop table |
-| `POST /otlp/v1/{traces,logs,metrics}` | OTLP/HTTP JSON ingest with envelope unwrapping and spec-shaped `partialSuccess` responses |
+| `POST /otlp/v1/{traces,logs,metrics}` | OTLP/HTTP ingest (JSON or protobuf bodies) with envelope unwrapping and spec-shaped `partialSuccess` responses |
 
 Requests run on their own connections/transactions; a bearer `token` guards everything except
 `/health`; CORS is enabled for browser clients; gzip is supported both ways (request bodies with
@@ -197,19 +197,20 @@ localhost by default.
 
 ### OpenTelemetry SDKs
 
-The OTLP routes follow the standard signal paths, so SDKs only need the endpoint base and the
-JSON encoding:
+The OTLP routes follow the standard signal paths and accept both wire encodings — `http/protobuf`
+(the SDK default) and `http/json` — so SDKs only need the endpoint base:
 
 ```sh
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:9999/otlp
-export OTEL_EXPORTER_OTLP_PROTOCOL=http/json
 export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer rt_secret"
 ```
 
 Signals land in `otel_traces`, `otel_logs`, and `otel_metrics` by default; route them to custom
 tables with the `x-rawduck-traces-table`, `x-rawduck-logs-table`, or `x-rawduck-metrics-table`
-headers (the generic `x-rawduck-table` also works). Responses are OTLP-conformant: an empty
-`partialSuccess` on full acceptance, with signal-specific rejected counts otherwise.
+headers (the generic `x-rawduck-table` also works). Responses are OTLP-conformant in the request's
+encoding: an empty `partialSuccess` on full acceptance, signal-specific rejected counts otherwise.
+Both encodings produce identical columns — trace/span ids stored as hex, enum fields as integers,
+`*UnixNano` timestamps as `BIGINT` — so mixed fleets of exporters share tables cleanly.
 
 ### OTLP/gRPC
 
@@ -230,7 +231,7 @@ export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer rt_secret"
 Requests are converted through protobuf's canonical OTLP/JSON mapping and flow through the same
 native ingestion path as the HTTP routes, with the same `x-rawduck-*-table` routing (sent as gRPC
 metadata) and `partialSuccess` semantics. On builds without gRPC the functions explain themselves;
-OTLP/HTTP protobuf bodies still get a 415 pointing at `http/json` or the gRPC endpoint.
+OTLP/HTTP (both encodings) stays fully functional.
 
 ## ATTACH: RawMergeTree stores
 
@@ -356,11 +357,16 @@ git submodule update --init
 GEN=ninja make release
 ```
 
-The OTLP/gRPC server is **opt-in at build time** (it pulls the gRPC/protobuf stack, which
+OTLP/HTTP protobuf decoding is **on by default**: builds pick up protobuf from the vcpkg
+manifest's default `protobuf` feature (or a system package locally) and skip it gracefully when
+unavailable (wasm builds, or `make release RAWDUCK_DISABLE_OTLP_PROTOBUF=1`); without it, protobuf
+bodies get a 415 pointing at `http/json`.
+
+The OTLP/gRPC server is **opt-in at build time** (it pulls the full gRPC stack, which
 significantly lengthens builds): `make release RAWDUCK_ENABLE_GRPC=1` enables it, using the
 `grpc` vcpkg manifest feature in CI or system gRPC/protobuf locally. Default builds skip it —
-OTLP/HTTP stays fully functional and `raw_serve_grpc()` explains how to enable support. The flag
-is cached per build directory; run `make clean` when toggling it. wasm builds never include it.
+OTLP/HTTP stays fully functional and `raw_serve_grpc()` explains how to enable support. The flags
+are cached per build directory; run `make clean` when toggling them. wasm builds never include them.
 
 Artifacts:
 

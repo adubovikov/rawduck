@@ -429,3 +429,18 @@ SELECT body, pod, status, "resource.service.name", "timeUnixNano", typeof("timeU
 FROM raw_records('{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"api"}}]},"scopeLogs":[{"scope":{"name":"http"},"logRecords":[{"timeUnixNano":"1718000000000000000","body":{"stringValue":"request ok"},"attributes":[{"key":"pod","value":{"stringValue":"pod-a"}},{"key":"status","value":{"intValue":"200"}}]}]}]}]}', transform := 'otlp-logs');
 ----
 request ok	pod-a	200	api	1718000000000000000	BIGINT
+
+# OTLP id normalization: protobuf's JSON conversion (gRPC / OTLP-HTTP protobuf
+# bodies) emits trace/span ids as base64; OTLP/JSON mandates hex
+query III
+SELECT "traceId", "spanId", "parentSpanId"
+FROM raw_records('{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"AQIDBAUGBwgJCgsMDQ4PEA==","spanId":"AQIDBAUGBwg=","parentSpanId":"AQIDBAUGBwg=","name":"op"}]}]}]}', transform := 'otlp-traces');
+----
+0102030405060708090a0b0c0d0e0f10	0102030405060708	0102030405060708
+
+# already-hex ids (OTLP/JSON senders) pass through untouched
+query II
+SELECT "traceId", "spanId"
+FROM raw_records('{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"traceId":"5B8EFFF798038103D269B633813FC60C","spanId":"EEE19B7EC3C1B174","body":{"stringValue":"x"}}]}]}]}', transform := 'otlp-logs');
+----
+5B8EFFF798038103D269B633813FC60C	EEE19B7EC3C1B174

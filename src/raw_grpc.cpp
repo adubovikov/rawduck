@@ -96,6 +96,9 @@ grpc::Status ExportSignal(const grpc::ServerContext &context, const google::prot
 
 	string payload;
 	google::protobuf::util::JsonPrintOptions options;
+	// the OTLP/JSON mapping requires enum fields (kind, severityNumber,
+	// status.code, ...) as integers, matching what http/json SDKs send
+	options.always_print_enums_as_ints = true;
 	auto converted = google::protobuf::util::MessageToJsonString(request, &payload, options);
 	if (!converted.ok()) {
 		return grpc::Status(grpc::StatusCode::INTERNAL, "failed to convert OTLP request to JSON");

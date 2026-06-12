@@ -10,5 +10,12 @@ ifeq ($(RAWDUCK_ENABLE_GRPC),1)
 	EXT_FLAGS:=$(EXT_FLAGS) -DRAWDUCK_ENABLE_GRPC=1 -DVCPKG_MANIFEST_FEATURES=grpc
 endif
 
+# OTLP/protobuf HTTP bodies are decoded by default (vcpkg manifest default
+# feature "protobuf"); disable to skip the protobuf dependency entirely:
+# make release RAWDUCK_DISABLE_OTLP_PROTOBUF=1
+ifeq ($(RAWDUCK_DISABLE_OTLP_PROTOBUF),1)
+	EXT_FLAGS:=$(EXT_FLAGS) -DRAWDUCK_ENABLE_OTLP_PROTOBUF=0 -DVCPKG_MANIFEST_NO_DEFAULT_FEATURES=ON
+endif
+
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile

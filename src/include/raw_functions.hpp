@@ -70,6 +70,12 @@ PhysicalOperator &RawPlanIngestInsert(ClientContext &context, PhysicalPlanGenera
 // constant-time token comparison (HTTP and gRPC auth)
 bool RawTokenEquals(const string &provided, const string &expected);
 
+// OTLP/HTTP protobuf bodies (raw_otlp_pb.cpp; stubs when built without protobuf)
+bool RawOtlpProtobufSupported();
+bool RawOtlpProtobufToJson(const string &signal, const string &body, string &json_out, string &error);
+string RawOtlpProtobufResponse(const string &signal, uint64_t rejected, const string &error_message);
+string RawOtlpStatusBytes(const string &message);
+
 // shared SQL generation helpers
 string RawQuoteIdentifier(const string &name);
 string RawQualifiedTarget(const string &target);
