@@ -134,7 +134,7 @@ bool Authorized(const duckdb_httplib::Request &req, duckdb_httplib::Response &re
 	if (token.empty()) {
 		return true;
 	}
-	if (req.get_header_value("Authorization") == "Bearer " + token) {
+	if (RawTokenEquals(req.get_header_value("Authorization"), "Bearer " + token)) {
 		return true;
 	}
 	RespondError(res, 401, "missing or invalid bearer token");
@@ -352,6 +352,22 @@ void HandleDrop(duckdb_httplib::Response &res, const string &table) {
 	Respond(res, 200, json, root);
 }
 
+} // namespace
+
+// constant-time comparison: token checks must not leak length/prefix timing
+bool RawTokenEquals(const string &provided, const string &expected) {
+	if (provided.size() != expected.size()) {
+		return false;
+	}
+	unsigned char acc = 0;
+	for (idx_t i = 0; i < provided.size(); i++) {
+		acc |= static_cast<unsigned char>(provided[i]) ^ static_cast<unsigned char>(expected[i]);
+	}
+	return acc == 0;
+}
+
+namespace {
+
 void RegisterRoutes(duckdb_httplib::Server &server) {
 	// browser clients: permissive CORS, preflight handled globally
 	server.set_default_headers(
@@ -359,6 +375,8 @@ void RegisterRoutes(duckdb_httplib::Server &server) {
 	     {"Access-Control-Allow-Headers", "Authorization, Content-Type, x-rawduck-table, x-rawduck-traces-table, "
 	                                      "x-rawduck-logs-table, x-rawduck-metrics-table"},
 	     {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"}});
+	// cap request bodies: ingest payloads should be batched, not unbounded
+	server.set_payload_max_length(256ULL * 1024ULL * 1024ULL);
 	server.Options(R"(/.*)", [](const duckdb_httplib::Request &, duckdb_httplib::Response &res) { res.status = 204; });
 	server.Get("/health", [](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
 		res.set_content("{\"status\":\"ok\"}", "application/json");

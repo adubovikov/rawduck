@@ -20,6 +20,9 @@ using duckdb_yyjson::yyjson_val;
 static constexpr idx_t RAW_MAX_FLATTEN_DEPTH = 16;
 // guard against pathological payloads exploding the table schema
 static constexpr idx_t RAW_MAX_COLUMNS = 10000;
+// recursion guard: nesting beyond this is preserved verbatim as JSON instead
+// of risking stack exhaustion on hostile inputs
+static constexpr idx_t RAW_MAX_NESTING = 128;
 static constexpr auto RAW_READ_FLAGS = duckdb_yyjson::YYJSON_READ_ALLOW_INF_AND_NAN;
 
 //===--------------------------------------------------------------------===//
@@ -196,7 +199,7 @@ static void ExplodeInto(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjson::yyjso
 
 static duckdb_yyjson::yyjson_mut_val *OtlpNormalizeValue(duckdb_yyjson::yyjson_mut_doc *doc,
                                                          duckdb_yyjson::yyjson_mut_val *value, const char *key,
-                                                         size_t key_len);
+                                                         size_t key_len, idx_t depth);
 
 static bool OtlpIsKeyValueArray(duckdb_yyjson::yyjson_mut_val *value) {
 	if (!duckdb_yyjson::yyjson_mut_is_arr(value) || duckdb_yyjson::yyjson_mut_arr_size(value) == 0) {
@@ -243,12 +246,13 @@ static duckdb_yyjson::yyjson_mut_val *OtlpUnwrapAnyValue(duckdb_yyjson::yyjson_m
 		if (!values) {
 			return nullptr;
 		}
-		return OtlpNormalizeValue(doc, values, name == "kvlistValue" ? "attributes" : "", 0);
+		return OtlpNormalizeValue(doc, values, name == "kvlistValue" ? "attributes" : "", 0, 0);
 	}
 	return nullptr;
 }
 
-static void OtlpNormalizeObject(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjson::yyjson_mut_val *object) {
+static void OtlpNormalizeObject(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjson::yyjson_mut_val *object,
+                                idx_t depth) {
 	// rebuild members so attribute lists can spread into the parent
 	vector<pair<duckdb_yyjson::yyjson_mut_val *, duckdb_yyjson::yyjson_mut_val *>> members;
 	duckdb_yyjson::yyjson_mut_obj_iter iter;
@@ -270,7 +274,7 @@ static void OtlpNormalizeObject(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjso
 				if (!name || !duckdb_yyjson::yyjson_mut_is_str(name)) {
 					continue;
 				}
-				auto normalized = value ? OtlpNormalizeValue(doc, value, "", 0) : nullptr;
+				auto normalized = value ? OtlpNormalizeValue(doc, value, "", 0, depth + 1) : nullptr;
 				if (normalized && !duckdb_yyjson::yyjson_mut_obj_getn(object, duckdb_yyjson::yyjson_mut_get_str(name),
 				                                                      duckdb_yyjson::yyjson_mut_get_len(name))) {
 					duckdb_yyjson::yyjson_mut_obj_add(object, name, normalized);
@@ -278,7 +282,7 @@ static void OtlpNormalizeObject(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjso
 			}
 			continue;
 		}
-		auto normalized = OtlpNormalizeValue(doc, member.second, key_str, key_len);
+		auto normalized = OtlpNormalizeValue(doc, member.second, key_str, key_len, depth + 1);
 		if (!duckdb_yyjson::yyjson_mut_obj_getn(object, key_str, key_len)) {
 			duckdb_yyjson::yyjson_mut_obj_add(object, member.first, normalized ? normalized : member.second);
 		}
@@ -287,13 +291,17 @@ static void OtlpNormalizeObject(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjso
 
 static duckdb_yyjson::yyjson_mut_val *OtlpNormalizeValue(duckdb_yyjson::yyjson_mut_doc *doc,
                                                          duckdb_yyjson::yyjson_mut_val *value, const char *key,
-                                                         size_t key_len) {
+                                                         size_t key_len, idx_t depth) {
+	if (depth > RAW_MAX_NESTING) {
+		// too deep to normalize safely: keep the value verbatim
+		return value;
+	}
 	if (duckdb_yyjson::yyjson_mut_is_obj(value)) {
 		auto unwrapped = OtlpUnwrapAnyValue(doc, value);
 		if (unwrapped) {
 			return unwrapped;
 		}
-		OtlpNormalizeObject(doc, value);
+		OtlpNormalizeObject(doc, value, depth + 1);
 		return value;
 	}
 	if (OtlpIsKeyValueArray(value)) {
@@ -305,7 +313,7 @@ static duckdb_yyjson::yyjson_mut_val *OtlpNormalizeValue(duckdb_yyjson::yyjson_m
 			auto name = duckdb_yyjson::yyjson_mut_obj_get(element, "key");
 			auto inner = duckdb_yyjson::yyjson_mut_obj_get(element, "value");
 			if (name && duckdb_yyjson::yyjson_mut_is_str(name) && inner) {
-				auto normalized = OtlpNormalizeValue(doc, inner, "", 0);
+				auto normalized = OtlpNormalizeValue(doc, inner, "", 0, depth + 1);
 				duckdb_yyjson::yyjson_mut_obj_add(converted, name, normalized ? normalized : inner);
 			}
 		}
@@ -320,7 +328,7 @@ static duckdb_yyjson::yyjson_mut_val *OtlpNormalizeValue(duckdb_yyjson::yyjson_m
 		}
 		duckdb_yyjson::yyjson_mut_arr_clear(value);
 		for (auto element : originals) {
-			auto normalized = OtlpNormalizeValue(doc, element, "", 0);
+			auto normalized = OtlpNormalizeValue(doc, element, "", 0, depth + 1);
 			duckdb_yyjson::yyjson_mut_arr_append(value, normalized ? normalized : element);
 		}
 		return value;
@@ -349,7 +357,7 @@ void RawPayload::Explode(const vector<string> &path) {
 		duckdb_yyjson::yyjson_mut_arr_iter normalized_rows;
 		duckdb_yyjson::yyjson_mut_arr_iter_init(out_rows, &normalized_rows);
 		while (auto row = duckdb_yyjson::yyjson_mut_arr_iter_next(&normalized_rows)) {
-			OtlpNormalizeValue(mut_doc, row, "", 0);
+			OtlpNormalizeValue(mut_doc, row, "", 0, 0);
 		}
 	}
 
@@ -519,6 +527,8 @@ RawScalarKind SniffScalarKind(yyjson_val *val) {
 	}
 }
 
+static void MergeValueInternal(RawNode &node, yyjson_val *val, idx_t depth);
+
 static void DemoteToJSON(RawNode &node) {
 	node.node_class = RawNodeClass::JSON;
 	node.children.clear();
@@ -527,6 +537,14 @@ static void DemoteToJSON(RawNode &node) {
 }
 
 void MergeValue(RawNode &node, yyjson_val *val) {
+	MergeValueInternal(node, val, 0);
+}
+
+static void MergeValueInternal(RawNode &node, yyjson_val *val, idx_t depth) {
+	if (depth > RAW_MAX_NESTING) {
+		DemoteToJSON(node);
+		return;
+	}
 	if (!val || duckdb_yyjson::yyjson_is_null(val)) {
 		return;
 	}
@@ -546,7 +564,7 @@ void MergeValue(RawNode &node, yyjson_val *val) {
 		while (auto key = duckdb_yyjson::yyjson_obj_iter_next(&iter)) {
 			auto child_val = duckdb_yyjson::yyjson_obj_iter_get_val(key);
 			auto key_str = string(duckdb_yyjson::yyjson_get_str(key), duckdb_yyjson::yyjson_get_len(key));
-			MergeValue(node.GetOrCreateChild(key_str), child_val);
+			MergeValueInternal(node.GetOrCreateChild(key_str), child_val, depth + 1);
 		}
 		return;
 	}
@@ -562,7 +580,7 @@ void MergeValue(RawNode &node, yyjson_val *val) {
 		yyjson_arr_iter iter;
 		duckdb_yyjson::yyjson_arr_iter_init(val, &iter);
 		while (auto element = duckdb_yyjson::yyjson_arr_iter_next(&iter)) {
-			MergeValue(*node.element, element);
+			MergeValueInternal(*node.element, element, depth + 1);
 		}
 		return;
 	}

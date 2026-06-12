@@ -79,7 +79,7 @@ string MetadataValue(const grpc::ServerContext &context, const string &key) {
 grpc::Status ExportSignal(const grpc::ServerContext &context, const google::protobuf::Message &request,
                           const string &signal, uint64_t &rejected, string &error_message) {
 	auto &state = GetGrpcState();
-	if (!state.token.empty() && MetadataValue(context, "authorization") != "Bearer " + state.token) {
+	if (!state.token.empty() && !RawTokenEquals(MetadataValue(context, "authorization"), "Bearer " + state.token)) {
 		return Unauthenticated();
 	}
 	auto db = state.db.lock();

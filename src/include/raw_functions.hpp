@@ -67,6 +67,9 @@ bool RawIsIngestTable(const TableCatalogEntry &table);
 PhysicalOperator &RawPlanIngestInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
                                       optional_ptr<PhysicalOperator> plan);
 
+// constant-time token comparison (HTTP and gRPC auth)
+bool RawTokenEquals(const string &provided, const string &expected);
+
 // shared SQL generation helpers
 string RawQuoteIdentifier(const string &name);
 string RawQualifiedTarget(const string &target);
