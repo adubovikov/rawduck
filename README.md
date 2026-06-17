@@ -11,7 +11,7 @@ flattens nested objects into real columns, transforms and evolves the schema as 
 ### ⚡ Benefits
 No `CREATE TABLE`, no schema declarations, no `json_extract` at query time. Because data lands
 shredded into native typed columns instead of opaque JSON strings, analytical queries run
-**45–265× faster** on **40% smaller** than the JSON-column approach (see benchmark).
+**15–38× faster** on telemetry queries, **3.5× smaller** on disk — see benchmark.
 
 ### ⚙️ Under the hood
 RawDuck delivers a complete engine rather than a parser: ingestion is transactional, pipelined, and
@@ -61,41 +61,31 @@ For ingestion outside a RawDuck store (the default in-memory catalog, DuckLake, 
 commands are table functions: invoke them with `CALL`, or use `SELECT ... FROM fn(...)` when you
 want to project or filter their result columns.
 
-## Benchmark: one hour of GitHub, three ways
+## Benchmark: OTEL at line speed
 
-Real [GH Archive](https://www.gharchive.org/) data — **247,199 GitHub events, 956 MB of NDJSON,
-wildly heterogeneous payloads** (the dataset RawBench uses). One `INSERT` shredded it into
-**914 typed columns**, schema evolution included. The baseline is the standard DuckDB JSON
-extension pattern: a single `JSON` column queried with `->>` paths.
+Real OTLP/JSON export envelopes — logs, metrics, traces — shredded into typed columns on
+ingest. Apple Silicon, DuckDB v1.5.3, 1M records per signal:
 
-Same machine (Apple Silicon, DuckDB v1.5.3), best of 3:
-
-| RawBench-style query | JSON column (`->>`) | RawDuck typed columns | speedup |
+| signal | ingest | records/s | on disk |
 |---|---:|---:|---:|
-| count by event type | 231 ms | 1 ms | **231×** |
-| top repos by pushes | 268 ms | 3 ms | **89×** |
-| distinct repos per actor | 457 ms | 10 ms | **46×** |
-| sum of push payload sizes | 265 ms | 1 ms | **265×** |
-| events per minute | 236 ms | 3 ms | **79×** |
-| *all five combined* | *1.46 s* | *18 ms* | **~80×** |
+| traces | 1.65 s | **604k** | 72 MB |
+| logs | 1.71 s | **586k** | 61 MB |
+| metrics | 1.30 s | **771k** | 56 MB |
 
-| | JSON column | RawDuck |
-|---|---:|---:|
-| ingest (full hour, 956 MB) | 1.4 s | **~6 s** |
-| storage on disk | 1.05 GB | **627 MB** |
-
-Ingestion is fully parallel (zero-copy parse from source vectors, multi-threaded appends,
-drain-free schema evolution): the pipeline sustains **~6.1M rows/s** on narrow JSON and lands the
-heterogeneous 956 MB hour in ~6 s — a one-time cost a few times that of loading opaque JSON
-strings, in exchange for every later query being 45–265× faster and the data 40% smaller on disk.
+**3M telemetry records in 4.7 s.** Queries on shredded spans run **15–38× faster** than a JSON
+column with identical results; storage is **3.5× smaller**. One call handles envelope explode,
+KeyValue attribute flattening, and byte-id normalization — no schema upfront:
 
 ```sql
-INSERT INTO raw.ingest.gh_events SELECT json::VARCHAR FROM read_json(...);  -- ~6s, 914 columns
+CALL raw_ingest_file('traces', 'export.ndjson', transform := 'otlp-traces');
 
-SELECT type, count(*) FROM raw.gh_events GROUP BY type ORDER BY 2 DESC;      -- 1 ms
-SELECT "repo.name", count(*) AS pushes FROM raw.gh_events
-WHERE type = 'PushEvent' GROUP BY 1 ORDER BY pushes DESC LIMIT 10;           -- 3 ms
+SELECT "resource.service.name", count(*) FROM traces
+WHERE "http.status_code" >= 500 GROUP BY 1;   -- 3 ms
 ```
+
+As a wide-schema stress test, one hour of [GH Archive](https://www.gharchive.org/) data (914
+columns, 247k events) still lands in ~13 s with **45–265×** query speedup over JSON columns.
+Full methodology, query suites, and reproduction steps: [BENCHMARK.md](BENCHMARK.md).
 
 ## Functions
 
@@ -158,10 +148,11 @@ Semantics to know before enabling it:
   session does not un-enqueue them, and a failed background flush drops that batch.
 - Data buffered for less than the age threshold is lost if the database closes first; call
   `raw_flush()` before shutdown.
-- The HTTP and gRPC servers ingest asynchronously by default (their clients are exactly the
-  many-small-writers case, and a single flusher also serializes schema evolution instead of
-  letting per-request transactions race on it). Start them with `async := false` to make every
-  request its own synchronous transaction.
+- The HTTP and gRPC servers ingest **synchronously by default**: a row is queryable the moment
+  the insert call returns, which is what insert-then-query clients expect. Pass `async := true`
+  to opt into buffered ingestion when the workload is many concurrent fire-and-forget producers
+  (a single flusher then also serializes schema evolution instead of letting per-request
+  transactions race on it); call `raw_flush()` to drain before reading.
 
 ## HTTP API
 
@@ -175,11 +166,11 @@ CALL raw_serve_stop();
 ```sh
 curl -X POST localhost:9999/v1/tables/events -H "Authorization: Bearer rt_secret" \
      -d '[{"action":"click","user":"alice","value":42}]'
-# {"table":"events","inserted":1,"created":true,"columns_added":3,"errors":0}
+# {"inserted":1}
 
 curl -X POST localhost:9999/v1/query -H "Authorization: Bearer rt_secret" \
      -d '{"sql":"SELECT action, count(*) FROM events GROUP BY action"}'
-# {"meta":[...],"data":[["click",1]],"rows":1,"statistics":{"elapsed":0.0016}}
+# {"meta":[...],"data":[{"action":"click","count_star":1}],"rows":1,"statistics":{"elapsed":0.0016,"rows_read":1,"bytes_read":16},"hints":[]}
 ```
 
 | Endpoint | Behavior |
