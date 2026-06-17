@@ -66,11 +66,11 @@ want to project or filter their result columns.
 Real OTLP/JSON export envelopes — logs, metrics, traces — shredded into typed columns on
 ingest. Apple Silicon, DuckDB v1.5.3, 1M records per signal:
 
-| signal | ingest | records/s | on disk |
-|---|---:|---:|---:|
-| traces | 1.65 s | **604k** | 72 MB |
-| logs | 1.71 s | **586k** | 61 MB |
-| metrics | 1.30 s | **771k** | 56 MB |
+| signal | records | columns | source NDJSON | ingest | records/s | throughput | on disk |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| traces  | 1,000,000 | 23 | 704 MB | 1.65 s | 604k | 426 MB/s | 72 MB |
+| logs    | 1,000,000 | 20 | 598 MB | 1.71 s | 586k | 350 MB/s | 61 MB |
+| metrics | 1,000,000 | 13 | 495 MB | 1.30 s | 771k | 381 MB/s | 56 MB |
 
 **3M telemetry records in 4.7 s.** Queries on shredded spans run **15–38× faster** than a JSON
 column with identical results; storage is **3.5× smaller**. One call handles envelope explode,
