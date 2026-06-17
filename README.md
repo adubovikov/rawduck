@@ -112,6 +112,7 @@ WHERE type = 'PushEvent' GROUP BY 1 ORDER BY pushes DESC LIMIT 10;           -- 
 | `raw_projections()` | table | The projection advisor: GROUP BY shapes queries actually run, with observation counts and materialization status. |
 | `raw_project(table)` | table | RawMergeTree auto-projections: materializes the hottest observed aggregation as a lightweight `<table>__proj` summary table. |
 | `raw_serve(host, port, token)` / `raw_serve_stop()` | table | Start/stop the in-process HTTP API (see below). |
+| `ATTACH 'rawduck:quack:host:port' AS … (TOKEN '…')` | SQL | Remote RawDuck store over Quack (requires `quack` on client and RawDuck on server). |
 | `raw_serve_grpc(host, port, token)` / `raw_serve_grpc_stop()` | table | Start/stop the OTLP/gRPC collector (opt-in build, see Building). |
 | `raw_flush()` | table | Synchronously drain the async-insert buffers. |
 | `raw_type(json)` | scalar | Concrete type of a JSON value (RawMergeTree's `dynamicType()`): `Null`, `Bool`, `Int64`, `UInt64`, `Double`, `String`, `Array`, `Object`. |
@@ -247,6 +248,46 @@ and adaptive-layout machinery. Stores persist and reattach like any database fil
 Two kinds of `INSERT` coexist: typed inserts into the real tables behave exactly like DuckDB
 (fixed columns, binder-validated), while inserts into the virtual `ingest` schema take raw JSON
 payloads and handle creation and evolution. Both run in your transaction.
+
+### Remote stores via Quack
+
+Attach a RawDuck server over the [Quack](https://github.com/duckdb/duckdb-quack) RPC protocol.
+The **server** must run DuckDB with RawDuck loaded (ingestion, schema evolution, and the ingest
+lane live on the server). The **client** needs both extensions:
+
+```sql
+INSTALL quack; LOAD quack; LOAD rawduck;
+ATTACH 'rawduck:quack:127.0.0.1:19920' AS raw (TOKEN 'secret');
+```
+
+| Attach URI | Catalog type | `raw.ingest.*` | Typical use |
+|---|---|---|---|
+| `rawduck:store.db` | `rawduck` | yes | local on-disk store |
+| `rawduck:quack:host:port` | `rawduck` | yes | remote RawDuck over Quack |
+| `quack:host:port` | `quack` | no | remote reads / typed DML only |
+
+On the server, start a Quack listener and ingest as usual:
+
+```sql
+LOAD rawduck; LOAD quack;
+SELECT * FROM quack_serve('quack:127.0.0.1:19920', token := 'secret');
+CALL raw_ingest('events', '[{"action":"click"}]');
+```
+
+From the client, queries and the ingest lane work like a local attach:
+
+```sql
+SELECT * FROM raw.events;
+INSERT INTO raw.ingest.events VALUES ('{"action":"view","user":"bob"}');
+INSERT INTO raw.ingest.events SELECT json::VARCHAR FROM read_json('batch.ndjson',
+    format='newline_delimited', records='false', columns={json: 'JSON'});
+```
+
+`rawduck:quack:` delegates table scans and DML to Quack while preserving RawDuck catalog
+identity — including `PlanInsert` routing for the virtual `ingest` schema (remote `raw_ingest`
+under the hood). Plain `ATTACH 'quack:…'` is fine for ad-hoc reads or `quack_query`, but does
+not expose `raw.ingest.*`. For stateless one-off SQL, `quack_query('quack:host:port', $$…$$,
+token := 'secret')` works without attaching.
 
 ## Transforms
 
@@ -384,7 +425,8 @@ make test
 
 The sqllogictests in `test/sql/` cover all standard JSON types, nested flattening, NDJSON, type
 widening, schema evolution, structural conflicts, streaming file ingestion, multi-threaded appends, transforms, projections,
-error-tolerant ingestion, RawDuck stores (`ATTACH 'rawduck:...'`), transactional rollback,
+error-tolerant ingestion, RawDuck stores (`ATTACH 'rawduck:...'` and `ATTACH 'rawduck:quack:...'`),
+Quack remote attach (`test/sql/raw_quack.test`), transactional rollback,
 predicate statistics + adaptive reordering, and DuckLake catalogs (`test/sql/ducklake.test`).
 
 ## Status
@@ -392,8 +434,8 @@ predicate statistics + adaptive reordering, and DuckLake catalogs (`test/sql/duc
 All RawMergeTree concepts are implemented: schema-less evolving ingestion
 (native, transactional, pipelined, multi-threaded), adaptive physical layout from observed
 predicates with incremental re-sorting, the projection advisor with automatic aggregate rewriting,
-extensible ingest-time transforms, persisted statistics, RawDuck stores, DuckLake fallback, and
-an in-process HTTP API for ingestion and querying.
+extensible ingest-time transforms, persisted statistics, RawDuck stores, Quack remote attach,
+DuckLake fallback, and an in-process HTTP API for ingestion and querying.
 
 See [BENCHMARK.md](BENCHMARK.md) to reproduce the numbers and [AGENTS.md](AGENTS.md) for the
 design guide.
