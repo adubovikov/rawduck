@@ -87,6 +87,11 @@ As a wide-schema stress test, one hour of [GH Archive](https://www.gharchive.org
 columns, 247k events) still lands in ~13 s with **45–265×** query speedup over JSON columns.
 Full methodology, query suites, and reproduction steps: [BENCHMARK.md](BENCHMARK.md).
 
+
+## Integrations
+
+RawDuck is compatible with the [RawTree MCP](https://github.com/rawtreedb/rawtree-mcp) and [RawTree SDK](https://github.com/rawtreedb/rawtree-sdk-typescript)
+
 ## Functions
 
 | Function | Kind | Description |
