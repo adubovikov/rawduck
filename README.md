@@ -19,6 +19,12 @@ multi-threaded through DuckDB's own catalog and storage APIs (`BEGIN`/`ROLLBACK`
 observes the workload and adapts — physically re-sorting tables by the columns queries actually 
 filter on (incrementally, MergeTree-parts style) and answering recurring aggregations from projections. 
 
+## Install
+```sql
+INSTALL rawduck FROM community;
+LOAD rawduck;
+```
+
 ## Usage
 
 Attach a store and `INSERT` raw JSON — tables, typed columns, and schema all emerge from the data:
