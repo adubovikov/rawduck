@@ -43,6 +43,23 @@ DESCRIBE raw.events;
 SELECT "user.name", count(*) FROM raw.events GROUP BY 1;
 ```
 
+You can keep extending the object - RawDuck will automatically handle schema changes
+
+```sql
+INSERT INTO raw.ingest.events VALUES
+    ('{"id": 3, "action": "click", "ts": "2024-01-15T10:30:00", "user": {"name": "alice", "plan": "pro", "error":"bad auth"}}');
+
+SELECT * FROM raw.events;
+┌───────┬─────────┬─────────────────────┬───────────┬───────────┬────────────┐
+│  id   │ action  │         ts          │ user.name │ user.plan │ user.error │
+│ int64 │ varchar │      timestamp      │  varchar  │  varchar  │  varchar   │
+├───────┼─────────┼─────────────────────┼───────────┼───────────┼────────────┤
+│     1 │ click   │ 2024-01-15 10:30:00 │ alice     │ pro       │ NULL       │
+│     2 │ view    │ 2024-01-15 10:31:00 │ bob       │ NULL      │ NULL       │
+│     3 │ click   │ 2024-01-15 10:30:00 │ alice     │ pro       │ bad auth   │
+└───────┴─────────┴─────────────────────┴───────────┴───────────┴────────────┘
+```
+
 The `ingest` schema accepts any SQL source through a fully parallel zero-copy sink
 
 ```sql
