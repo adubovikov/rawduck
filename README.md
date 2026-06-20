@@ -41,11 +41,9 @@ DESCRIBE raw.events;
 -- id BIGINT, action VARCHAR, ts TIMESTAMP, user.name VARCHAR, user.plan VARCHAR
 
 SELECT "user.name", count(*) FROM raw.events GROUP BY 1;
-```
 
-You can keep extending the object - RawDuck will automatically handle schema changes
+-- keep extending the object - RawDuck will automatically handle schema changes
 
-```sql
 INSERT INTO raw.ingest.events VALUES
     ('{"id": 3, "action": "click", "ts": "2024-01-15T10:30:00", "user": {"name": "alice", "plan": "pro", "error":"bad auth"}}');
 
