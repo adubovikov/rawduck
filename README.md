@@ -44,7 +44,6 @@ SELECT "user.name", count(*) FROM raw.events GROUP BY 1;
 ```
 
 The `ingest` schema accepts any SQL source through a fully parallel zero-copy sink
-(**6.1M rows/s** on narrow JSON; a 956 MB heterogeneous NDJSON file in ~6 s):
 
 ```sql
 INSERT INTO raw.ingest.events SELECT json FROM read_json('events.ndjson',
