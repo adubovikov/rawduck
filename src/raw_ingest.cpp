@@ -2,6 +2,8 @@
 #include "raw_json.hpp"
 #include "raw_write_settings.hpp"
 
+#include <atomic>
+
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -32,22 +34,11 @@
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
-#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <thread>
 
 namespace duckdb {
-
-static void MergeParsedPayloads(RawParsedPayload &into, RawParsedPayload &&from) {
-	into.payload.rows.insert(into.payload.rows.end(), from.payload.rows.begin(), from.payload.rows.end());
-	for (auto *doc : from.payload.docs) {
-		into.payload.docs.push_back(doc);
-	}
-	from.payload.docs.clear();
-	from.payload.rows.clear();
-	from.payload.parse_errors = 0;
-}
 
 //===--------------------------------------------------------------------===//
 // Schema-shape cache: high-rate small inserts mostly repeat the same payload
@@ -86,6 +77,16 @@ static uint64_t HashPayloadShape(const vector<RawColumn> &columns) {
 		shape = (shape ^ static_cast<uint64_t>(column.type.id())) * 0x100000001b3ULL;
 	}
 	return shape;
+}
+
+static void MergeParsedPayloads(RawParsedPayload &into, RawParsedPayload &&from) {
+	into.payload.rows.insert(into.payload.rows.end(), from.payload.rows.begin(), from.payload.rows.end());
+	for (auto *doc : from.payload.docs) {
+		into.payload.docs.push_back(doc);
+	}
+	from.payload.docs.clear();
+	from.payload.rows.clear();
+	from.payload.parse_errors = 0;
 }
 
 //===--------------------------------------------------------------------===//
@@ -599,6 +600,19 @@ public:
 		}
 	}
 
+	// merges any outstanding parallel appends; must be called before the
+	// ingestion result is read
+	void Finish() {
+		if (pool) {
+			auto table = LookupTable();
+			if (!table) {
+				throw InternalException("RawDuck: table %s disappeared during ingestion", target);
+			}
+			rows += pool->Drain(*table);
+			pool.reset();
+		}
+	}
+
 	// Schema evolution (serial). Returns true when the append pool owns the batch.
 	bool PrepareForAppend(RawParsedPayload &parsed) {
 		write_settings = RawWriteSettings::Get(context);
@@ -655,8 +669,6 @@ public:
 		return pool != nullptr;
 	}
 
-	// Append a schema-ready batch. Pool submit is thread-safe; serial append uses
-	// the caller's coordination.
 	void SubmitPreparedBatch(shared_ptr<RawParsedPayload> parsed_ptr, bool use_pool) {
 		auto &parsed = *parsed_ptr;
 		if (parsed.payload.rows.empty()) {
@@ -675,20 +687,6 @@ public:
 
 	optional_ptr<TableCatalogEntry> LookupTableForAppend() {
 		return LookupTable();
-	}
-
-	// merges any outstanding parallel appends; must be called before the
-	// ingestion result is read
-	void Finish() {
-		if (pool) {
-			auto table = LookupTable();
-			if (!table) {
-				throw InternalException("RawDuck: table %s disappeared during ingestion", target);
-			}
-			rows += pool->Drain(*table);
-			pool.reset();
-		}
-		RawMaybeCheckpointAfterIngest(context, rows);
 	}
 
 	bool created = false;
@@ -791,7 +789,7 @@ private:
 	}
 
 	bool PoolEligible(TableCatalogEntry &table, RawParsedPayload &parsed) {
-		if (parsed.payload.rows.size() < RawWriteSettings::FAST_POOL_MIN_ROWS) {
+		if (parsed.payload.rows.size() < write_settings.pool_min_rows) {
 			return false;
 		}
 		auto &columns_list = table.GetColumns();
@@ -809,19 +807,71 @@ private:
 		if (pool || parsed.payload.rows.empty() || !PoolEligible(table, parsed)) {
 			return;
 		}
+		write_settings = RawWriteSettings::Get(context);
 		auto worker_count = write_settings.PoolThreadCount(parsed.payload.rows.size());
 		auto overlap = write_settings.OverlapFlushForBatch(context, shape_absorbed, parsed.payload.rows.size());
 		pool = make_uniq<RawAppendPool>(context, table, worker_count, overlap, write_settings.pipeline_depth);
 	}
 
 	void IngestNative(shared_ptr<RawParsedPayload> parsed_ptr) {
-		auto table = LookupTable();
-		if (!table || parsed_ptr->columns.empty()) {
+		auto &parsed = *parsed_ptr;
+		auto table = LookupTableCached();
+		if (!table || parsed.columns.empty()) {
 			LegacyIngestNative(std::move(parsed_ptr), table);
 			return;
 		}
-		auto use_pool = PrepareForAppend(*parsed_ptr);
-		SubmitPreparedBatch(std::move(parsed_ptr), use_pool);
+		auto cache_key = qname.catalog + "." + qname.schema + "." + qname.name;
+		auto shape = HashPayloadShape(parsed.columns);
+		auto &cache = *ObjectCache::GetObjectCache(context).GetOrCreate<RawSchemaCache>(RawSchemaCache::ObjectType());
+		bool absorbed;
+		{
+			lock_guard<mutex> guard(cache.lock);
+			auto entry = cache.tables.find(cache_key);
+			absorbed = entry != cache.tables.end() && entry->second.storage_token == &table->GetStorage() &&
+			           entry->second.absorbed_shapes.count(shape) > 0;
+		}
+		bool shape_absorbed = absorbed;
+		if (!absorbed) {
+			// schema-delta slow path, then absorb the shape
+			auto &catalog = Catalog::GetCatalog(context, qname.catalog);
+			MetaTransaction::Get(context).ModifyDatabase(
+			    catalog.GetAttached(), DatabaseModificationType::ALTER_TABLE | DatabaseModificationType::INSERT_DATA);
+			vector<pair<string, LogicalType>> adds;
+			bool widens = false;
+			ComputeDelta(*table, parsed, adds, widens);
+			if (pool && widens) {
+				rows += pool->Drain(*table);
+				pool.reset();
+			}
+			EvolveNative(catalog, *table, parsed);
+			InvalidateTableCache();
+			table = LookupTableCached();
+			if (!table) {
+				throw InternalException("RawDuck: table %s disappeared during ingestion", target);
+			}
+			if (pool && !adds.empty()) {
+				pool->PublishColumns(adds, table->GetStorage());
+			}
+			lock_guard<mutex> guard(cache.lock);
+			auto &entry = cache.tables[cache_key];
+			if (entry.storage_token != &table->GetStorage()) {
+				entry.storage_token = &table->GetStorage();
+				entry.absorbed_shapes.clear();
+			}
+			entry.absorbed_shapes.insert(shape);
+			shape_absorbed = true;
+		}
+		if (parsed.payload.rows.empty()) {
+			return;
+		}
+		MetaTransaction::Get(context).ModifyDatabase(Catalog::GetCatalog(context, qname.catalog).GetAttached(),
+		                                             DatabaseModificationType::INSERT_DATA);
+		EnsurePool(*table, parsed, shape_absorbed);
+		if (pool) {
+			pool->Submit(std::move(parsed_ptr));
+			return;
+		}
+		AppendNative(*table, parsed);
 	}
 
 	void LegacyIngestNative(shared_ptr<RawParsedPayload> parsed_ptr, optional_ptr<TableCatalogEntry> table) {
@@ -869,13 +919,11 @@ private:
 			return;
 		}
 		// re-resolve: DDL replaces the catalog entry
-		table = LookupTable();
+		table = LookupTableCached();
 		if (!table) {
 			throw InternalException("RawDuck: table %s disappeared during ingestion", target);
 		}
-		if (!pool && PoolEligible(*table, parsed)) {
-			EnsurePool(*table, parsed, false);
-		}
+		EnsurePool(*table, parsed, true);
 		if (pool) {
 			pool->Submit(std::move(parsed_ptr));
 			return;
@@ -953,6 +1001,7 @@ private:
 				if (RawFillSupported(types[slot])) {
 					FillVector(extractor.ColumnValues(col), types[slot], chunk.data[slot], 0);
 				} else {
+					// extract in the payload's inferred type, then cast
 					Vector source(parsed.columns[col].type, count);
 					FillVector(extractor.ColumnValues(col), parsed.columns[col].type, source, 0);
 					VectorOperations::DefaultCast(source, chunk.data[slot], count);
@@ -1158,6 +1207,7 @@ public:
 		ingestor.Ingest(payload);
 	}
 	void IngestParsedConcurrent(shared_ptr<RawParsedPayload> parsed) override {
+		ingestor.errors += parsed->payload.parse_errors;
 		bool use_pool = false;
 		{
 			lock_guard<mutex> guard(schema_lock);
@@ -1166,7 +1216,6 @@ public:
 				ingestor.IngestParsed(std::move(parsed), empty_payload);
 				return;
 			}
-			ingestor.errors += parsed->payload.parse_errors;
 			use_pool = ingestor.PrepareForAppend(*parsed);
 		}
 		if (use_pool) {
@@ -1246,6 +1295,16 @@ static unique_ptr<GlobalTableFunctionState> RawIngestInit(ClientContext &context
 	return make_uniq<RawIngestState>();
 }
 
+static void EmitIngestRow(DataChunk &output, const string &target, const RawIngestor &ingestor) {
+	output.SetValue(0, 0, Value(target));
+	output.SetValue(1, 0, Value::BOOLEAN(ingestor.created));
+	output.SetValue(2, 0, Value::BIGINT(NumericCast<int64_t>(ingestor.columns_added)));
+	output.SetValue(3, 0, Value::BIGINT(NumericCast<int64_t>(ingestor.columns_widened)));
+	output.SetValue(4, 0, Value::BIGINT(NumericCast<int64_t>(ingestor.rows)));
+	output.SetValue(5, 0, Value::BIGINT(NumericCast<int64_t>(ingestor.errors)));
+	output.SetCardinality(1);
+}
+
 static void EmitIngestRow(DataChunk &output, const string &target, const RawIngestStats &stats) {
 	output.SetValue(0, 0, Value(target));
 	output.SetValue(1, 0, Value::BOOLEAN(stats.created));
@@ -1254,12 +1313,6 @@ static void EmitIngestRow(DataChunk &output, const string &target, const RawInge
 	output.SetValue(4, 0, Value::BIGINT(NumericCast<int64_t>(stats.rows)));
 	output.SetValue(5, 0, Value::BIGINT(NumericCast<int64_t>(stats.errors)));
 	output.SetCardinality(1);
-}
-
-static void EmitIngestRow(DataChunk &output, const string &target, const RawIngestor &ingestor) {
-	EmitIngestRow(output, target,
-	              RawIngestStats {ingestor.created, ingestor.columns_added, ingestor.columns_widened, ingestor.rows,
-	                              ingestor.errors});
 }
 
 static void RawIngestFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
@@ -1338,13 +1391,13 @@ static unique_ptr<FunctionData> RawIngestFileBind(ClientContext &context, TableF
 // Bounded handoff between the parse thread and the appending thread: parsing
 // and inference are pure and overlap with catalog/storage work.
 struct RawIngestPipeline {
+	explicit RawIngestPipeline(idx_t capacity_p) : capacity(capacity_p) {
+	}
+
 	struct Item {
 		shared_ptr<RawParsedPayload> parsed;
 		string payload;
 	};
-
-	explicit RawIngestPipeline(idx_t capacity) : capacity(capacity) {
-	}
 
 	idx_t capacity;
 
@@ -1444,10 +1497,9 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 	                                              FileOpenFlags(FileCompressionType::AUTO_DETECT));
 
 	auto write_settings = RawWriteSettings::Get(context);
-	auto stream = RawCreateStreamIngestor(context, bind_data.target, bind_data.options);
+	auto batch_size = bind_data.batch_size;
 	RawIngestPipeline pipeline(write_settings.pipeline_depth);
 	auto options = bind_data.options;
-	auto batch_size = bind_data.batch_size;
 
 	// reader thread: owns the file handle, splits NDJSON into raw batches
 	std::thread reader([&pipeline, &handle, batch_size] {
@@ -1525,79 +1577,101 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 	mutex consumer_error_lock;
 	std::exception_ptr consumer_error;
 
-	auto flush_pending = [&](RawIngestPipeline::Item &pending_storage, bool &has_pending) {
+	auto coalesce_and_ingest = [&](auto ingest_fn, RawIngestPipeline::Item &pending_storage, bool &has_pending,
+	                               RawIngestPipeline::Item item) {
 		if (!has_pending) {
+			pending_storage = std::move(item);
+			has_pending = true;
 			return;
 		}
-		stream->IngestParsedConcurrent(std::move(pending_storage.parsed));
-		has_pending = false;
+		auto pending_shape = HashPayloadShape(pending_storage.parsed->columns);
+		auto item_shape = HashPayloadShape(item.parsed->columns);
+		if (pending_shape == item_shape &&
+		    pending_storage.parsed->payload.rows.size() + item.parsed->payload.rows.size() <
+		        write_settings.pool_min_rows) {
+			MergeParsedPayloads(*pending_storage.parsed, std::move(*item.parsed));
+			return;
+		}
+		ingest_fn(std::move(pending_storage));
+		pending_storage = std::move(item);
+		has_pending = true;
 	};
 
-	auto consumer_loop = [&] {
-		try {
+	idx_t batches_result = 0;
+	try {
+		if (consumer_count > 1) {
+			auto stream = RawCreateStreamIngestor(context, bind_data.target, bind_data.options);
+			auto consumer_loop = [&] {
+				try {
+					RawIngestPipeline::Item pending_storage;
+					bool has_pending = false;
+					RawIngestPipeline::Item item;
+					while (pipeline.Pop(item)) {
+						batches.fetch_add(1);
+						coalesce_and_ingest(
+						    [&](RawIngestPipeline::Item pending) {
+							    stream->IngestParsedConcurrent(std::move(pending.parsed));
+						    },
+						    pending_storage, has_pending, std::move(item));
+					}
+					if (has_pending) {
+						stream->IngestParsedConcurrent(std::move(pending_storage.parsed));
+					}
+				} catch (...) {
+					lock_guard<mutex> guard(consumer_error_lock);
+					if (!consumer_error) {
+						consumer_error = std::current_exception();
+					}
+					pipeline.Abort();
+				}
+			};
+			vector<std::thread> consumers;
+			consumers.reserve(consumer_count);
+			for (idx_t i = 0; i < consumer_count; i++) {
+				consumers.emplace_back(consumer_loop);
+			}
+			for (auto &consumer : consumers) {
+				consumer.join();
+			}
+			if (consumer_error) {
+				std::rethrow_exception(consumer_error);
+			}
+			stream->Finish();
+			batches_result = batches.load();
+			EmitIngestRow(output, bind_data.target, stream->GetStats());
+		} else {
+			RawIngestor ingestor(context, bind_data.target, bind_data.options);
 			RawIngestPipeline::Item pending_storage;
 			bool has_pending = false;
 			RawIngestPipeline::Item item;
 			while (pipeline.Pop(item)) {
-				batches.fetch_add(1);
-				if (!has_pending) {
-					pending_storage = std::move(item);
-					has_pending = true;
-					continue;
-				}
-				auto pending_shape = HashPayloadShape(pending_storage.parsed->columns);
-				auto item_shape = HashPayloadShape(item.parsed->columns);
-				if (pending_shape == item_shape &&
-				    pending_storage.parsed->payload.rows.size() + item.parsed->payload.rows.size() <
-				        write_settings.pool_min_rows) {
-					MergeParsedPayloads(*pending_storage.parsed, std::move(*item.parsed));
-					continue;
-				}
-				stream->IngestParsedConcurrent(std::move(pending_storage.parsed));
-				pending_storage = std::move(item);
-				has_pending = true;
+				batches_result++;
+				coalesce_and_ingest(
+				    [&](RawIngestPipeline::Item pending) {
+					    ingestor.IngestParsed(std::move(pending.parsed), pending.payload);
+				    },
+				    pending_storage, has_pending, std::move(item));
 			}
-			flush_pending(pending_storage, has_pending);
-		} catch (...) {
-			lock_guard<mutex> guard(consumer_error_lock);
-			if (!consumer_error) {
-				consumer_error = std::current_exception();
+			if (has_pending) {
+				ingestor.IngestParsed(std::move(pending_storage.parsed), pending_storage.payload);
 			}
-			pipeline.Abort();
-		}
-	};
-
-	vector<std::thread> consumers;
-	consumers.reserve(consumer_count);
-	for (idx_t i = 0; i < consumer_count; i++) {
-		consumers.emplace_back(consumer_loop);
-	}
-
-	try {
-		join_all();
-		for (auto &consumer : consumers) {
-			consumer.join();
+			ingestor.Finish();
+			EmitIngestRow(output, bind_data.target, ingestor);
+			output.SetValue(6, 0, Value::BIGINT(NumericCast<int64_t>(batches_result)));
 		}
 	} catch (...) {
 		pipeline.Abort();
-		for (auto &consumer : consumers) {
-			if (consumer.joinable()) {
-				consumer.join();
-			}
-		}
+		join_all();
 		throw;
 	}
-	if (consumer_error) {
-		std::rethrow_exception(consumer_error);
-	}
+	join_all();
 	if (pipeline.error) {
 		std::rethrow_exception(pipeline.error);
 	}
-	stream->Finish();
-
-	auto stats = stream->GetStats();
-	EmitIngestRow(output, bind_data.target, stats);
-	output.SetValue(6, 0, Value::BIGINT(NumericCast<int64_t>(batches.load())));
+	if (consumer_count > 1) {
+		output.SetValue(6, 0, Value::BIGINT(NumericCast<int64_t>(batches_result)));
+	}
+	return;
 }
 
 TableFunction GetRawIngestFileFunction() {
