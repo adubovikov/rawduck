@@ -1,0 +1,82 @@
+#
+# PR validation: build, SQLLogic tests, and write-path benchmark gate.
+#
+name: PR Validation
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'test/**'
+      - 'scripts/**'
+      - 'CMakeLists.txt'
+      - 'extension_config.cmake'
+      - 'Makefile'
+      - '.github/workflows/PrValidation.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'test/**'
+      - 'scripts/**'
+      - 'CMakeLists.txt'
+  workflow_dispatch:
+
+concurrency:
+  group: pr-validation-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build & SQLLogic tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache
+
+      - name: Build release
+        run: GEN=ninja make release
+
+      - name: Run SQLLogic tests
+        run: make test
+
+  write-benchmark-gate:
+    name: Write A/B benchmark gate
+    runs-on: ubuntu-24.04
+    needs: build-and-test
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache
+
+      - name: Build release
+        run: GEN=ninja make release
+
+      - name: Run A/B stats (3 rounds) and check regression threshold
+        env:
+          ROUNDS: 3
+          WRITE_REGRESSION_MAX_PCT: 10
+        run: ./scripts/ci_benchmark_gate.sh
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vs-release-benchmark
+          path: |
+            agent_planning/bench/vs_release/ab_stats_results.txt
+            agent_planning/bench/vs_release/ab_stats_rounds.csv
