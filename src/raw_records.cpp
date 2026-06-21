@@ -11,7 +11,7 @@ struct RawRecordsBindData : public TableFunctionData {
 
 struct RawRecordsState : public GlobalTableFunctionState {
 	explicit RawRecordsState(const RawRecordsBindData &bind_data)
-	    : extractor(*bind_data.parsed->root, bind_data.parsed->columns) {
+	    : extractor(bind_data.parsed->SchemaRoot(), bind_data.parsed->columns) {
 	}
 
 	idx_t next_row = 0;

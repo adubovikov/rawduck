@@ -11,6 +11,7 @@ struct StorageExtensionInfo;
 class TransactionManager;
 struct RawParseOptions;
 struct RawParsedPayload;
+struct RawCachedSchema;
 
 TableFunction GetRawRecordsFunction();
 TableFunction GetRawIngestFunction();
@@ -57,6 +58,9 @@ public:
 	virtual void Finish() = 0;
 	virtual idx_t Rows() const = 0;
 	virtual RawIngestStats GetStats() const = 0;
+	// for schema cache lookups by parser threads
+	virtual string GetSchemaCacheKey() const = 0;
+	virtual shared_ptr<RawCachedSchema> LookupCachedSchema(uint64_t shape) = 0;
 };
 unique_ptr<RawStreamIngestor> RawCreateStreamIngestor(ClientContext &context, const string &target,
                                                       RawParseOptions options);
