@@ -503,6 +503,7 @@ void RawPayloadFinalize(RawParsedPayload &parsed, const RawParseOptions &options
 		parsed.payload.Explode(options.explode_path);
 	}
 	parsed.root = parsed.payload.InferSchema();
+	// FlattenSchema assigns column_idx on each leaf node
 	parsed.columns = FlattenSchema(*parsed.root, parsed.payload.scalar_rows);
 }
 
@@ -511,6 +512,16 @@ shared_ptr<RawParsedPayload> RawParsedPayload::Process(const string &payload_tex
 	result->payload.Parse(payload_text, options);
 	result->root = result->payload.InferSchema();
 	result->columns = FlattenSchema(*result->root, result->payload.scalar_rows);
+	return result;
+}
+
+shared_ptr<RawParsedPayload> RawParsedPayload::ProcessWithSchema(const string &payload_text,
+                                                                  const RawParseOptions &options,
+                                                                  const shared_ptr<RawCachedSchema> &cached) {
+	auto result = make_shared_ptr<RawParsedPayload>();
+	result->payload.Parse(payload_text, options);
+	result->root_shared = cached->root;
+	result->columns = cached->columns;
 	return result;
 }
 
@@ -662,8 +673,14 @@ static void MergeValueInternal(RawNode &node, yyjson_val *val, idx_t depth) {
 		duckdb_yyjson::yyjson_obj_iter_init(val, &iter);
 		while (auto key = duckdb_yyjson::yyjson_obj_iter_next(&iter)) {
 			auto child_val = duckdb_yyjson::yyjson_obj_iter_get_val(key);
-			auto key_str = string(duckdb_yyjson::yyjson_get_str(key), duckdb_yyjson::yyjson_get_len(key));
-			MergeValueInternal(node.GetOrCreateChild(key_str), child_val, depth + 1);
+			auto key_ptr = duckdb_yyjson::yyjson_get_str(key);
+			auto key_len = duckdb_yyjson::yyjson_get_len(key);
+			auto existing = node.FindChild(key_ptr, key_len);
+			if (existing != DConstants::INVALID_INDEX) {
+				MergeValueInternal(*node.children[existing].second, child_val, depth + 1);
+			} else {
+				MergeValueInternal(node.GetOrCreateChild(string(key_ptr, key_len)), child_val, depth + 1);
+			}
 		}
 		return;
 	}
@@ -747,7 +764,7 @@ LogicalType NodeToType(const RawNode &node) {
 	}
 }
 
-static void FlattenInto(const RawNode &node, const string &prefix, vector<string> &path, idx_t depth,
+static void FlattenInto(RawNode &node, const string &prefix, vector<string> &path, idx_t depth,
                         vector<RawColumn> &result) {
 	for (auto &entry : node.children) {
 		auto &name = entry.first;
@@ -755,20 +772,23 @@ static void FlattenInto(const RawNode &node, const string &prefix, vector<string
 		auto column_name = prefix.empty() ? name : prefix + "." + name;
 		path.push_back(name);
 		if (child.node_class == RawNodeClass::OBJECT && !child.children.empty() && depth < RAW_MAX_FLATTEN_DEPTH) {
+			child.column_idx = RAW_NODE_NO_COLUMN;
 			FlattenInto(child, column_name, path, depth + 1, result);
 		} else {
+			child.column_idx = result.size();
 			result.push_back(RawColumn {column_name, path, NodeToType(child), &child});
 		}
 		path.pop_back();
 	}
 }
 
-vector<RawColumn> FlattenSchema(const RawNode &root, bool scalar_rows) {
+vector<RawColumn> FlattenSchema(RawNode &root, bool scalar_rows) {
 	vector<RawColumn> result;
 	if (scalar_rows || root.node_class != RawNodeClass::OBJECT) {
 		if (root.node_class == RawNodeClass::UNSET) {
 			return result;
 		}
+		root.column_idx = 0;
 		result.push_back(RawColumn {"value", {}, NodeToType(root), &root});
 		return result;
 	}
@@ -780,7 +800,6 @@ vector<RawColumn> FlattenSchema(const RawNode &root, bool scalar_rows) {
 		    "reduce key cardinality",
 		    result.size(), RAW_MAX_COLUMNS);
 	}
-	// flattening can collide (e.g. key "a.b" vs nested a->b): disambiguate
 	case_insensitive_set_t seen;
 	for (auto &column : result) {
 		auto base = column.name;
@@ -821,48 +840,46 @@ bool RawFillSupported(const LogicalType &type) {
 }
 
 RawExtractor::RawExtractor(const RawNode &root_p, const vector<RawColumn> &columns) : root(root_p) {
-	values.resize(columns.size());
-	for (idx_t col = 0; col < columns.size(); col++) {
+	column_count = columns.size();
+	values.resize(column_count);
+	for (idx_t col = 0; col < column_count; col++) {
 		if (columns[col].path.empty()) {
-			// "value" column: the row itself is the value
 			root_is_column = true;
+			root_column_idx = root_p.column_idx;
 		}
-		column_of[columns[col].node] = col;
 	}
 }
 
 void RawExtractor::Reset(idx_t row_count) {
-	for (auto &column_values : values) {
-		column_values.assign(row_count, nullptr);
+	for (idx_t col = 0; col < column_count; col++) {
+		auto &cv = values[col];
+		cv.resize(row_count);
+		memset(cv.data(), 0, row_count * sizeof(duckdb_yyjson::yyjson_val *));
 	}
 }
 
 void RawExtractor::Traverse(yyjson_val *val, const RawNode &node, idx_t row_idx) {
-	auto leaf = column_of.find(&node);
-	if (leaf != column_of.end()) {
-		values[leaf->second][row_idx] = val;
+	if (node.column_idx != RAW_NODE_NO_COLUMN) {
+		values[node.column_idx][row_idx] = val;
 		return;
 	}
 	if (node.node_class != RawNodeClass::OBJECT || !duckdb_yyjson::yyjson_is_obj(val)) {
-		// value at a path that is neither a column nor a flattened object
-		// (e.g. a structural mismatch): nothing to route
 		return;
 	}
 	yyjson_obj_iter iter;
 	duckdb_yyjson::yyjson_obj_iter_init(val, &iter);
 	while (auto key = duckdb_yyjson::yyjson_obj_iter_next(&iter)) {
-		auto entry =
-		    node.child_lookup.find(string(duckdb_yyjson::yyjson_get_str(key), duckdb_yyjson::yyjson_get_len(key)));
-		if (entry == node.child_lookup.end()) {
+		auto child_idx = node.FindChild(duckdb_yyjson::yyjson_get_str(key), duckdb_yyjson::yyjson_get_len(key));
+		if (child_idx == DConstants::INVALID_INDEX) {
 			continue;
 		}
-		Traverse(duckdb_yyjson::yyjson_obj_iter_get_val(key), *node.children[entry->second].second, row_idx);
+		Traverse(duckdb_yyjson::yyjson_obj_iter_get_val(key), *node.children[child_idx].second, row_idx);
 	}
 }
 
 void RawExtractor::AssignRow(yyjson_val *row, idx_t row_idx) {
 	if (root_is_column) {
-		values[column_of.at(&root)][row_idx] = row;
+		values[root_column_idx][row_idx] = row;
 		return;
 	}
 	Traverse(row, root, row_idx);

@@ -3,6 +3,8 @@
 #include "duckdb.hpp"
 #include "yyjson.hpp"
 
+#include <cstring>
+
 namespace duckdb {
 
 //===--------------------------------------------------------------------===//
@@ -27,15 +29,31 @@ enum class RawNodeClass : uint8_t {
 	JSON       // structural conflict or unflattenable value: stored as JSON text
 };
 
+static constexpr idx_t RAW_NODE_NO_COLUMN = DConstants::INVALID_INDEX;
+
 struct RawNode {
 	RawNodeClass node_class = RawNodeClass::UNSET;
 	RawScalarKind scalar = RawScalarKind::UNSET;
+	// set by FlattenSchema: dense column index for leaf nodes, INVALID for
+	// intermediate objects — eliminates hash lookups in the extraction hot path
+	idx_t column_idx = RAW_NODE_NO_COLUMN;
 	// object children in first-seen order, so inferred column order is stable
 	vector<pair<string, unique_ptr<RawNode>>> children;
 	unordered_map<string, idx_t> child_lookup;
 	unique_ptr<RawNode> element;
 
 	RawNode &GetOrCreateChild(const string &key);
+
+	// zero-alloc child lookup by raw pointer+length (extraction hot path)
+	idx_t FindChild(const char *key, size_t len) const {
+		for (idx_t i = 0; i < children.size(); i++) {
+			auto &name = children[i].first;
+			if (name.size() == len && memcmp(name.data(), key, len) == 0) {
+				return i;
+			}
+		}
+		return DConstants::INVALID_INDEX;
+	}
 };
 
 // A flattened output column: `name` is the dotted path, `path` the segments to
@@ -81,15 +99,32 @@ struct RawPayload {
 	void Explode(const vector<string> &path);
 };
 
+// Immutable schema snapshot for reuse across batches with the same shape.
+// Shared (via shared_ptr) between RawSchemaCache and parser threads.
+struct RawCachedSchema {
+	shared_ptr<RawNode> root;
+	vector<RawColumn> columns;
+};
+
 // A fully processed payload: parsed rows plus the inferred flattened schema.
 // Parsed exactly once and shared by inference and extraction.
 struct RawParsedPayload {
 	RawPayload payload;
 	unique_ptr<RawNode> root;
+	// when using a cached schema, root_shared keeps it alive and root is unused
+	shared_ptr<RawNode> root_shared;
 	vector<RawColumn> columns;
+
+	const RawNode &SchemaRoot() const {
+		return root_shared ? *root_shared : *root;
+	}
 
 	static shared_ptr<RawParsedPayload> Process(const string &payload_text,
 	                                            const RawParseOptions &options = RawParseOptions());
+	// fast path: skip inference, reuse cached schema
+	static shared_ptr<RawParsedPayload> ProcessWithSchema(const string &payload_text,
+	                                                      const RawParseOptions &options,
+	                                                      const shared_ptr<RawCachedSchema> &cached);
 };
 
 // Incremental payload assembly (zero-copy INSERT sink): parse documents one
@@ -97,6 +132,9 @@ struct RawParsedPayload {
 // inference + flattening) once per batch.
 void RawPayloadAddDocument(RawParsedPayload &payload, const char *data, idx_t size, bool ignore_errors = false);
 void RawPayloadFinalize(RawParsedPayload &payload, const RawParseOptions &options = RawParseOptions());
+
+// FNV-1a hash over column names + type ids; used by the schema shape cache
+uint64_t HashPayloadShape(const vector<RawColumn> &columns);
 
 // Built-in ingest-time transforms (name -> dotted explode path); users can
 // register additional ones via raw_transform_define().
@@ -110,13 +148,14 @@ RawScalarKind SniffScalarKind(duckdb_yyjson::yyjson_val *val);
 void MergeValue(RawNode &node, duckdb_yyjson::yyjson_val *val);
 
 LogicalType NodeToType(const RawNode &node);
-vector<RawColumn> FlattenSchema(const RawNode &root, bool scalar_rows);
+vector<RawColumn> FlattenSchema(RawNode &root, bool scalar_rows);
 
 bool IsRawJSONType(const LogicalType &type);
 
 // Vectorized extraction. Rows are typically sparse compared to the unified
 // schema, so extraction is row-major: each row's JSON tree is traversed once
 // and values are routed to their column slot via the schema-tree nodes.
+// Uses dense column_idx on RawNode (set by FlattenSchema) instead of hash maps.
 class RawExtractor {
 public:
 	RawExtractor(const RawNode &root, const vector<RawColumn> &columns);
@@ -134,9 +173,9 @@ private:
 	void Traverse(duckdb_yyjson::yyjson_val *val, const RawNode &node, idx_t row_idx);
 
 	const RawNode &root;
-	// schema-tree leaf -> column slot
-	unordered_map<const RawNode *, idx_t> column_of;
 	bool root_is_column = false;
+	idx_t root_column_idx = RAW_NODE_NO_COLUMN;
+	idx_t column_count = 0;
 	vector<vector<duckdb_yyjson::yyjson_val *>> values;
 };
 
