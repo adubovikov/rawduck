@@ -146,7 +146,10 @@ make test
 agent_planning/bench/run_write_matrix.sh
 ./scripts/run_vs_release.sh          # optional A/B vs official release (v0.0.2)
 ./scripts/run_vs_release_stats.sh    # 5-round median/p95 A/B (ROUNDS=10 to override)
+./scripts/ci_benchmark_gate.sh       # same as CI: 3 rounds, fail if median write > +10% vs release
 ```
+
+CI (`.github/workflows/PrValidation.yml`) runs `make test` and `ci_benchmark_gate.sh` on every PR touching `src/` or `test/`.
 
 Compare `write_matrix_results.txt` ingest times against the prior run. Regressions on OTLP 100k or INSERT 500k need an explanation in the PR.
 

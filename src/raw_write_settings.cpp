@@ -28,6 +28,12 @@ RawWriteSettings RawWriteSettings::Get(ClientContext &context) {
 			settings.pipeline_threads = NumericCast<idx_t>(threads);
 		}
 	}
+	if (context.TryGetCurrentSetting("rawduck_pipeline_consumers", value) && !value.IsNull()) {
+		auto consumers = value.GetValue<int64_t>();
+		if (consumers > 0) {
+			settings.pipeline_consumers = NumericCast<idx_t>(consumers);
+		}
+	}
 	if (context.TryGetCurrentSetting("rawduck_pipeline_depth", value) && !value.IsNull()) {
 		auto depth = value.GetValue<int64_t>();
 		if (depth > 0) {
@@ -64,6 +70,17 @@ idx_t RawWriteSettings::PipelineThreadCount() const {
 		return MinValue<idx_t>(pipeline_threads, MAX_PIPELINE_THREADS);
 	}
 	return MaxValue<idx_t>(1, MinValue<idx_t>(std::thread::hardware_concurrency() * 2 / 3, AUTO_PIPELINE_THREAD_CAP));
+}
+
+idx_t RawWriteSettings::PipelineConsumerCount() const {
+	if (pipeline_consumers > 0) {
+		return MinValue<idx_t>(pipeline_consumers, MAX_PIPELINE_THREADS);
+	}
+	auto hw = std::thread::hardware_concurrency();
+	if (hw <= 1) {
+		return 1;
+	}
+	return MaxValue<idx_t>(2, MinValue<idx_t>(hw / 4, AUTO_PIPELINE_CONSUMER_CAP));
 }
 
 bool RawWriteSettings::OverlapFlushForBatch(ClientContext &context, bool shape_absorbed, idx_t batch_rows) const {

@@ -32,6 +32,7 @@
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <thread>
@@ -1164,6 +1165,7 @@ public:
 				ingestor.IngestParsed(std::move(parsed), empty_payload);
 				return;
 			}
+			ingestor.errors += parsed->payload.parse_errors;
 			use_pool = ingestor.PrepareForAppend(*parsed);
 		}
 		if (use_pool) {
@@ -1179,6 +1181,15 @@ public:
 	}
 	idx_t Rows() const override {
 		return ingestor.rows;
+	}
+	RawIngestStats GetStats() const override {
+		RawIngestStats stats;
+		stats.created = ingestor.created;
+		stats.columns_added = ingestor.columns_added;
+		stats.columns_widened = ingestor.columns_widened;
+		stats.rows = ingestor.rows;
+		stats.errors = ingestor.errors;
+		return stats;
 	}
 
 private:
@@ -1234,14 +1245,19 @@ static unique_ptr<GlobalTableFunctionState> RawIngestInit(ClientContext &context
 	return make_uniq<RawIngestState>();
 }
 
-static void EmitIngestRow(DataChunk &output, const string &target, const RawIngestor &ingestor) {
+static void EmitIngestRow(DataChunk &output, const string &target, const RawIngestStats &stats) {
 	output.SetValue(0, 0, Value(target));
-	output.SetValue(1, 0, Value::BOOLEAN(ingestor.created));
-	output.SetValue(2, 0, Value::BIGINT(NumericCast<int64_t>(ingestor.columns_added)));
-	output.SetValue(3, 0, Value::BIGINT(NumericCast<int64_t>(ingestor.columns_widened)));
-	output.SetValue(4, 0, Value::BIGINT(NumericCast<int64_t>(ingestor.rows)));
-	output.SetValue(5, 0, Value::BIGINT(NumericCast<int64_t>(ingestor.errors)));
+	output.SetValue(1, 0, Value::BOOLEAN(stats.created));
+	output.SetValue(2, 0, Value::BIGINT(NumericCast<int64_t>(stats.columns_added)));
+	output.SetValue(3, 0, Value::BIGINT(NumericCast<int64_t>(stats.columns_widened)));
+	output.SetValue(4, 0, Value::BIGINT(NumericCast<int64_t>(stats.rows)));
+	output.SetValue(5, 0, Value::BIGINT(NumericCast<int64_t>(stats.errors)));
 	output.SetCardinality(1);
+}
+
+static void EmitIngestRow(DataChunk &output, const string &target, const RawIngestor &ingestor) {
+	EmitIngestRow(output, target, RawIngestStats {ingestor.created, ingestor.columns_added, ingestor.columns_widened,
+	                                             ingestor.rows, ingestor.errors});
 }
 
 static void RawIngestFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
@@ -1374,8 +1390,10 @@ struct RawIngestPipeline {
 	}
 	bool Pop(Item &item) {
 		std::unique_lock<mutex> guard(lock);
-		consumer_cv.wait(guard, [&] { return !queue.empty() || (reader_done && active_parsers == 0); });
-		if (queue.empty()) {
+		consumer_cv.wait(guard, [&] {
+			return !queue.empty() || aborted || (reader_done && active_parsers == 0);
+		});
+		if (aborted || queue.empty()) {
 			return false;
 		}
 		item = std::move(queue.front());
@@ -1425,8 +1443,8 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 	auto handle = fs.OpenFile(bind_data.path, FileOpenFlags(FileFlags::FILE_FLAGS_READ) |
 	                                              FileOpenFlags(FileCompressionType::AUTO_DETECT));
 
-	RawIngestor ingestor(context, bind_data.target, bind_data.options);
 	auto write_settings = RawWriteSettings::Get(context);
+	auto stream = RawCreateStreamIngestor(context, bind_data.target, bind_data.options);
 	RawIngestPipeline pipeline(write_settings.pipeline_depth);
 	auto options = bind_data.options;
 	auto batch_size = bind_data.batch_size;
@@ -1502,48 +1520,84 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 		}
 	};
 
-	idx_t batches = 0;
-	optional_ptr<RawIngestPipeline::Item> pending_item;
-	RawIngestPipeline::Item pending_storage;
-	bool has_pending = false;
-	try {
-		RawIngestPipeline::Item item;
-		while (pipeline.Pop(item)) {
-			batches++;
-			if (!has_pending) {
-				pending_storage = std::move(item);
-				pending_item = pending_storage;
-				has_pending = true;
-				continue;
-			}
-			auto pending_shape = HashPayloadShape(pending_item->parsed->columns);
-			auto item_shape = HashPayloadShape(item.parsed->columns);
-			if (pending_shape == item_shape &&
-			    pending_item->parsed->payload.rows.size() + item.parsed->payload.rows.size() <
-			        write_settings.pool_min_rows) {
-				MergeParsedPayloads(*pending_item->parsed, std::move(*item.parsed));
-				continue;
-			}
-			ingestor.IngestParsed(std::move(pending_item->parsed), pending_item->payload);
-			pending_storage = std::move(item);
-			pending_item = pending_storage;
+	auto consumer_count = write_settings.PipelineConsumerCount();
+	std::atomic<idx_t> batches {0};
+	mutex consumer_error_lock;
+	std::exception_ptr consumer_error;
+
+	auto flush_pending = [&](RawIngestPipeline::Item &pending_storage, bool &has_pending) {
+		if (!has_pending) {
+			return;
 		}
-		if (has_pending) {
-			ingestor.IngestParsed(std::move(pending_item->parsed), pending_item->payload);
+		stream->IngestParsedConcurrent(std::move(pending_storage.parsed));
+		has_pending = false;
+	};
+
+	auto consumer_loop = [&] {
+		try {
+			RawIngestPipeline::Item pending_storage;
+			bool has_pending = false;
+			RawIngestPipeline::Item item;
+			while (pipeline.Pop(item)) {
+				batches.fetch_add(1);
+				if (!has_pending) {
+					pending_storage = std::move(item);
+					has_pending = true;
+					continue;
+				}
+				auto pending_shape = HashPayloadShape(pending_storage.parsed->columns);
+				auto item_shape = HashPayloadShape(item.parsed->columns);
+				if (pending_shape == item_shape &&
+				    pending_storage.parsed->payload.rows.size() + item.parsed->payload.rows.size() <
+				        write_settings.pool_min_rows) {
+					MergeParsedPayloads(*pending_storage.parsed, std::move(*item.parsed));
+					continue;
+				}
+				stream->IngestParsedConcurrent(std::move(pending_storage.parsed));
+				pending_storage = std::move(item);
+				has_pending = true;
+			}
+			flush_pending(pending_storage, has_pending);
+		} catch (...) {
+			lock_guard<mutex> guard(consumer_error_lock);
+			if (!consumer_error) {
+				consumer_error = std::current_exception();
+			}
+			pipeline.Abort();
+		}
+	};
+
+	vector<std::thread> consumers;
+	consumers.reserve(consumer_count);
+	for (idx_t i = 0; i < consumer_count; i++) {
+		consumers.emplace_back(consumer_loop);
+	}
+
+	try {
+		join_all();
+		for (auto &consumer : consumers) {
+			consumer.join();
 		}
 	} catch (...) {
 		pipeline.Abort();
-		join_all();
+		for (auto &consumer : consumers) {
+			if (consumer.joinable()) {
+				consumer.join();
+			}
+		}
 		throw;
 	}
-	join_all();
+	if (consumer_error) {
+		std::rethrow_exception(consumer_error);
+	}
 	if (pipeline.error) {
 		std::rethrow_exception(pipeline.error);
 	}
-	ingestor.Finish();
+	stream->Finish();
 
-	EmitIngestRow(output, bind_data.target, ingestor);
-	output.SetValue(6, 0, Value::BIGINT(NumericCast<int64_t>(batches)));
+	auto stats = stream->GetStats();
+	EmitIngestRow(output, bind_data.target, stats);
+	output.SetValue(6, 0, Value::BIGINT(NumericCast<int64_t>(batches.load())));
 }
 
 TableFunction GetRawIngestFileFunction() {

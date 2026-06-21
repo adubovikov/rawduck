@@ -62,3 +62,18 @@ query II
 SELECT count(*), max(k) FROM raw.parallel;
 ----
 5000	4999
+
+# parallel ingest consumers (schema serial, pool submit parallel)
+statement ok
+SET rawduck_checkpoint_after_ingest = 0;
+SET rawduck_pipeline_consumers = 2;
+
+query II
+SELECT rows, batches FROM raw_ingest_file('t_consumers', '__TEST_DIR__/fast_pool.ndjson', batch_size := 600);
+----
+1000	2
+
+query III
+SELECT count(*), count(DISTINCT n), sum(n) FROM t_consumers;
+----
+1000	1000	499500
