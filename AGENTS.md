@@ -145,6 +145,7 @@ GEN=ninja make release
 make test
 agent_planning/bench/run_write_matrix.sh
 ./scripts/run_vs_release.sh          # optional A/B vs official release (v0.0.2)
+./scripts/run_vs_release_stats.sh    # 5-round median/p95 A/B (ROUNDS=10 to override)
 ```
 
 Compare `write_matrix_results.txt` ingest times against the prior run. Regressions on OTLP 100k or INSERT 500k need an explanation in the PR.
