@@ -136,6 +136,19 @@ return wrong data—a proof test (e.g. tampering with a projection to prove the 
 `raw_ingest` output is `(table, created, columns_added, columns_widened, rows, errors)`;
 `raw_ingest_file` adds `batches`. Changing these schemas means updating every `query IIIIII` block.
 
+### Write-path validation (required before merge)
+
+Any change touching `raw_ingest.cpp`, `raw_insert.cpp`, or `raw_write_settings.cpp`:
+
+```sh
+GEN=ninja make release
+make test
+agent_planning/bench/run_write_matrix.sh
+./scripts/run_vs_release.sh          # optional A/B vs official release (v0.0.2)
+```
+
+Compare `write_matrix_results.txt` ingest times against the prior run. Regressions on OTLP 100k or INSERT 500k need an explanation in the PR.
+
 ## Known boundaries (documented, not hidden)
 
 - DuckLake fallback can't widen columns with expressions (`ALTER ... USING` unsupported there);

@@ -2,6 +2,7 @@
 
 #include "rawduck_extension.hpp"
 #include "raw_functions.hpp"
+#include "raw_write_settings.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/main/config.hpp"
@@ -51,6 +52,26 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "stable, overlapping parse with compression/IO. Faster on large stable-schema imports "
 	                          "at the cost of higher peak memory; off by default (drain-free)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("rawduck_pool_min_rows",
+	                          "Minimum rows per batch before engaging the multi-threaded append pool (fast pool uses "
+	                          "one worker from 512 rows up to this threshold)",
+	                          LogicalType::BIGINT, Value::BIGINT(RawWriteSettings::DEFAULT_POOL_MIN_ROWS));
+	config.AddExtensionOption("rawduck_pool_threads",
+	                          "Append pool worker threads (0 = auto: hw_concurrency/2 capped at 8 for large batches, "
+	                          "1 for fast-pool batches)",
+	                          LogicalType::BIGINT, Value::BIGINT(0));
+	config.AddExtensionOption("rawduck_pipeline_threads",
+	                          "Parse worker threads for raw_ingest_file (0 = auto, capped at 16)",
+	                          LogicalType::BIGINT, Value::BIGINT(0));
+	config.AddExtensionOption("rawduck_pipeline_depth",
+	                          "Queue depth for raw_ingest_file reader/parser handoff and append pool backpressure",
+	                          LogicalType::BIGINT, Value::BIGINT(RawWriteSettings::DEFAULT_PIPELINE_DEPTH));
+	config.AddExtensionOption("rawduck_overlap_flush_auto",
+	                          "Automatically enable overlap flush for stable absorbed schema shapes on large batches",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("rawduck_checkpoint_after_ingest",
+	                          "Run CHECKPOINT after ingesting at least this many rows (0 = disabled)",
+	                          LogicalType::BIGINT, Value::BIGINT(0));
 	// ATTACH 'rawduck:store.db' AS raw
 	StorageExtension::Register(config, "rawduck", GetRawDuckStorageExtension());
 }

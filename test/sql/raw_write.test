@@ -1,0 +1,64 @@
+# name: test/sql/raw_write.test
+# description: RawDuck write-path settings, fast pool, checkpoint, coalescing
+# group: [sql]
+
+require rawduck
+
+require json
+
+# fast pool: 512+ rows uses append pool with one worker
+statement ok
+COPY (SELECT range AS n, 'v' || (range % 7) AS v FROM range(1000)) TO '__TEST_DIR__/fast_pool.ndjson' (FORMAT json);
+
+query II
+SELECT rows, errors FROM raw_ingest_file('t_fast', '__TEST_DIR__/fast_pool.ndjson', batch_size := 600);
+----
+1000	0
+
+query III
+SELECT count(*), count(DISTINCT n), sum(n) FROM t_fast;
+----
+1000	1000	499500
+
+# tunable pool threshold
+statement ok
+SET rawduck_pool_min_rows = 200;
+
+query I
+SELECT rows FROM raw_ingest_file('t_thresh', '__TEST_DIR__/fast_pool.ndjson');
+----
+1000
+
+# overlap_flush_auto on stable re-ingest
+statement ok
+SET rawduck_overlap_flush_auto = true;
+SET rawduck_pool_min_rows = 4096;
+
+query I
+SELECT rows FROM raw_ingest_file('t_fast', '__TEST_DIR__/fast_pool.ndjson', batch_size := 600);
+----
+1000
+
+# checkpoint after ingest
+statement ok
+ATTACH 'rawduck:__TEST_DIR__/cp_store.db' AS cp;
+
+statement ok
+SET rawduck_checkpoint_after_ingest = 100;
+
+query IIIIII
+SELECT * FROM raw_ingest('cp.main.events', '[{"id":1},{"id":2},{"id":3}]');
+----
+cp.main.events	true	1	0	3	0
+
+# parallel INSERT ingest path (schema/append split)
+statement ok
+ATTACH 'rawduck:__TEST_DIR__/insert_write.db' AS raw;
+
+statement ok
+INSERT INTO raw.ingest.parallel SELECT '{"k":' || range || '}' FROM range(5000);
+
+query II
+SELECT count(*), max(k) FROM raw.parallel;
+----
+5000	4999
