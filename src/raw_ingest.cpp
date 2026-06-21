@@ -63,12 +63,28 @@ public:
 		// validity token: the table's DataTable address at absorption time
 		void *storage_token = nullptr;
 		unordered_set<uint64_t> absorbed_shapes;
+		// cached schema trees keyed by shape hash — parser threads can skip
+		// InferSchema+FlattenSchema when a shape has been absorbed
+		unordered_map<uint64_t, shared_ptr<RawCachedSchema>> cached_schemas;
 	};
 	mutex lock;
 	unordered_map<string, Entry> tables;
+
+	shared_ptr<RawCachedSchema> LookupSchema(const string &table_key, uint64_t shape) {
+		lock_guard<mutex> guard(lock);
+		auto entry = tables.find(table_key);
+		if (entry == tables.end()) {
+			return nullptr;
+		}
+		auto schema_it = entry->second.cached_schemas.find(shape);
+		if (schema_it == entry->second.cached_schemas.end()) {
+			return nullptr;
+		}
+		return schema_it->second;
+	}
 };
 
-static uint64_t HashPayloadShape(const vector<RawColumn> &columns) {
+uint64_t HashPayloadShape(const vector<RawColumn> &columns) {
 	uint64_t shape = 0xcbf29ce484222325ULL;
 	for (auto &column : columns) {
 		for (auto c : column.name) {
@@ -467,7 +483,7 @@ private:
 	void AppendBatch(Worker &worker, RawParsedPayload &parsed, DataChunk &chunk, bool allow_flush) {
 		auto &types = worker.local_types;
 		auto &slots = worker.local_slots;
-		RawExtractor extractor(*parsed.root, parsed.columns);
+		RawExtractor extractor(parsed.SchemaRoot(), parsed.columns);
 		auto shape = HashPayloadShape(parsed.columns);
 		vector<idx_t> slot_of;
 		vector<bool> covered;
@@ -613,6 +629,10 @@ public:
 		}
 	}
 
+	string CacheKey() const {
+		return qname.catalog + "." + qname.schema + "." + qname.name;
+	}
+
 	// Schema evolution (serial). Returns true when the append pool owns the batch.
 	bool PrepareForAppend(RawParsedPayload &parsed) {
 		write_settings = RawWriteSettings::Get(context);
@@ -656,8 +676,20 @@ public:
 			if (entry.storage_token != &table->GetStorage()) {
 				entry.storage_token = &table->GetStorage();
 				entry.absorbed_shapes.clear();
+				entry.cached_schemas.clear();
 			}
 			entry.absorbed_shapes.insert(shape);
+			if (entry.cached_schemas.find(shape) == entry.cached_schemas.end()) {
+				auto cached = make_shared_ptr<RawCachedSchema>();
+				if (parsed.root_shared) {
+					cached->root = parsed.root_shared;
+				} else {
+					cached->root = make_shared_ptr<RawNode>(std::move(*parsed.root));
+					parsed.root_shared = cached->root;
+				}
+				cached->columns = parsed.columns;
+				entry.cached_schemas[shape] = std::move(cached);
+			}
 			last_batch_shape_absorbed = true;
 		}
 		if (parsed.payload.rows.empty()) {
@@ -985,7 +1017,7 @@ private:
 
 		DataChunk chunk;
 		chunk.Initialize(Allocator::Get(context), types);
-		RawExtractor extractor(*parsed.root, parsed.columns);
+		RawExtractor extractor(parsed.SchemaRoot(), parsed.columns);
 		auto &storage = table.GetStorage();
 		auto &payload_rows = parsed.payload.rows;
 
@@ -1201,7 +1233,21 @@ namespace {
 class RawStreamIngestorImpl : public RawStreamIngestor {
 public:
 	RawStreamIngestorImpl(ClientContext &context, const string &target, RawParseOptions options)
-	    : parse_options(options), ingestor(context, target, std::move(options)) {
+	    : context_ref(context), parse_options(options), ingestor(context, target, std::move(options)) {
+		auto qname = QualifiedName::Parse(target);
+		if (qname.catalog.empty() && !qname.schema.empty()) {
+			if (DatabaseManager::Get(context).GetDatabase(context, qname.schema)) {
+				qname.catalog = qname.schema;
+				qname.schema = DEFAULT_SCHEMA;
+			}
+		}
+		if (qname.catalog.empty()) {
+			qname.catalog = DatabaseManager::GetDefaultDatabase(context);
+		}
+		if (qname.schema.empty()) {
+			qname.schema = DEFAULT_SCHEMA;
+		}
+		schema_cache_key = qname.catalog + "." + qname.schema + "." + qname.name;
 	}
 	void Ingest(const string &payload) override {
 		ingestor.Ingest(payload);
@@ -1242,8 +1288,22 @@ public:
 		return stats;
 	}
 
+	string GetSchemaCacheKey() const override {
+		return schema_cache_key;
+	}
+	shared_ptr<RawCachedSchema> LookupCachedSchema(uint64_t shape) override {
+		auto &obj_cache = ObjectCache::GetObjectCache(context_ref);
+		auto cache = obj_cache.Get<RawSchemaCache>(RawSchemaCache::ObjectType());
+		if (!cache) {
+			return nullptr;
+		}
+		return cache->LookupSchema(schema_cache_key, shape);
+	}
+
 private:
+	ClientContext &context_ref;
 	RawParseOptions parse_options;
+	string schema_cache_key;
 	string empty_payload;
 	mutex schema_lock;
 	RawIngestor ingestor;
@@ -1546,17 +1606,33 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 	});
 
 	// parse workers: parsing and inference are pure and scale with cores;
-	// batch order is irrelevant to ingestion
+	// batch order is irrelevant to ingestion.
+	// Schema cache fast path: once the consumer absorbs a shape, parser threads
+	// reuse the cached schema tree, skipping InferSchema+FlattenSchema entirely.
 	auto parser_count = write_settings.PipelineThreadCount();
 	pipeline.active_parsers = parser_count;
+	shared_ptr<RawCachedSchema> pipeline_cached_schema;
+	mutex pipeline_schema_lock;
+	std::atomic<bool> pipeline_schema_ready {false};
 	vector<std::thread> parsers;
 	for (idx_t i = 0; i < parser_count; i++) {
-		parsers.emplace_back([&pipeline, options] {
+		parsers.emplace_back([&pipeline, options, &pipeline_cached_schema, &pipeline_schema_lock,
+		                      &pipeline_schema_ready] {
 			std::exception_ptr parser_error;
 			try {
+				shared_ptr<RawCachedSchema> local_cached;
 				string batch;
 				while (pipeline.PopRaw(batch)) {
-					auto parsed = RawParsedPayload::Process(batch, options);
+					if (!local_cached && pipeline_schema_ready.load(std::memory_order_acquire)) {
+						lock_guard<mutex> guard(pipeline_schema_lock);
+						local_cached = pipeline_cached_schema;
+					}
+					shared_ptr<RawParsedPayload> parsed;
+					if (local_cached) {
+						parsed = RawParsedPayload::ProcessWithSchema(batch, options, local_cached);
+					} else {
+						parsed = RawParsedPayload::Process(batch, options);
+					}
 					pipeline.Push(RawIngestPipeline::Item {std::move(parsed), std::move(batch)});
 				}
 			} catch (...) {
@@ -1601,6 +1677,7 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 	try {
 		if (consumer_count > 1) {
 			auto stream = RawCreateStreamIngestor(context, bind_data.target, bind_data.options);
+			bool mc_schema_published = pipeline_schema_ready.load(std::memory_order_relaxed);
 			auto consumer_loop = [&] {
 				try {
 					RawIngestPipeline::Item pending_storage;
@@ -1610,7 +1687,17 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 						batches.fetch_add(1);
 						coalesce_and_ingest(
 						    [&](RawIngestPipeline::Item pending) {
+							    auto pending_shape = HashPayloadShape(pending.parsed->columns);
 							    stream->IngestParsedConcurrent(std::move(pending.parsed));
+							    if (!mc_schema_published) {
+								    auto cached = stream->LookupCachedSchema(pending_shape);
+								    if (cached) {
+									    lock_guard<mutex> guard(pipeline_schema_lock);
+									    pipeline_cached_schema = std::move(cached);
+									    pipeline_schema_ready.store(true, std::memory_order_release);
+									    mc_schema_published = true;
+								    }
+							    }
 						    },
 						    pending_storage, has_pending, std::move(item));
 					}
@@ -1643,12 +1730,28 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 			RawIngestor ingestor(context, bind_data.target, bind_data.options);
 			RawIngestPipeline::Item pending_storage;
 			bool has_pending = false;
+			bool schema_published = pipeline_schema_ready.load(std::memory_order_relaxed);
+			auto cache_key = ingestor.CacheKey();
 			RawIngestPipeline::Item item;
 			while (pipeline.Pop(item)) {
 				batches_result++;
 				coalesce_and_ingest(
 				    [&](RawIngestPipeline::Item pending) {
+					    auto pending_shape = HashPayloadShape(pending.parsed->columns);
 					    ingestor.IngestParsed(std::move(pending.parsed), pending.payload);
+					    if (!schema_published) {
+						    auto &obj_cache = ObjectCache::GetObjectCache(context);
+						    auto cache = obj_cache.Get<RawSchemaCache>(RawSchemaCache::ObjectType());
+						    if (cache) {
+							    auto cached = cache->LookupSchema(cache_key, pending_shape);
+							    if (cached) {
+								    lock_guard<mutex> guard(pipeline_schema_lock);
+								    pipeline_cached_schema = std::move(cached);
+								    pipeline_schema_ready.store(true, std::memory_order_release);
+								    schema_published = true;
+							    }
+						    }
+					    }
 				    },
 				    pending_storage, has_pending, std::move(item));
 			}
