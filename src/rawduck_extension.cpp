@@ -61,8 +61,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "1 for fast-pool batches)",
 	                          LogicalType::BIGINT, Value::BIGINT(0));
 	config.AddExtensionOption("rawduck_pipeline_threads",
-	                          "Parse worker threads for raw_ingest_file (0 = auto, capped at 8)",
-	                          LogicalType::BIGINT, Value::BIGINT(0));
+	                          "Parse worker threads for raw_ingest_file (0 = auto, capped at 8)", LogicalType::BIGINT,
+	                          Value::BIGINT(0));
 	config.AddExtensionOption("rawduck_pipeline_consumers",
 	                          "Ingest consumer threads for raw_ingest_file (0 = auto, capped at 4; schema serial, "
 	                          "pool submit parallel)",

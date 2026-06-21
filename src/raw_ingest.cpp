@@ -479,7 +479,8 @@ private:
 			for (idx_t col = 0; col < parsed.columns.size(); col++) {
 				auto entry = slots.find(parsed.columns[col].name);
 				if (entry == slots.end()) {
-					throw InternalException("RawDuck: column %s missing from append pool schema", parsed.columns[col].name);
+					throw InternalException("RawDuck: column %s missing from append pool schema",
+					                        parsed.columns[col].name);
 				}
 				slot_of[col] = entry->second;
 				covered[entry->second] = true;
@@ -1256,8 +1257,9 @@ static void EmitIngestRow(DataChunk &output, const string &target, const RawInge
 }
 
 static void EmitIngestRow(DataChunk &output, const string &target, const RawIngestor &ingestor) {
-	EmitIngestRow(output, target, RawIngestStats {ingestor.created, ingestor.columns_added, ingestor.columns_widened,
-	                                             ingestor.rows, ingestor.errors});
+	EmitIngestRow(output, target,
+	              RawIngestStats {ingestor.created, ingestor.columns_added, ingestor.columns_widened, ingestor.rows,
+	                              ingestor.errors});
 }
 
 static void RawIngestFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
@@ -1390,9 +1392,7 @@ struct RawIngestPipeline {
 	}
 	bool Pop(Item &item) {
 		std::unique_lock<mutex> guard(lock);
-		consumer_cv.wait(guard, [&] {
-			return !queue.empty() || aborted || (reader_done && active_parsers == 0);
-		});
+		consumer_cv.wait(guard, [&] { return !queue.empty() || aborted || (reader_done && active_parsers == 0); });
 		if (aborted || queue.empty()) {
 			return false;
 		}
