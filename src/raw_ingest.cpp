@@ -1616,30 +1616,30 @@ static void RawIngestFileFunction(ClientContext &context, TableFunctionInput &da
 	std::atomic<bool> pipeline_schema_ready {false};
 	vector<std::thread> parsers;
 	for (idx_t i = 0; i < parser_count; i++) {
-		parsers.emplace_back([&pipeline, options, &pipeline_cached_schema, &pipeline_schema_lock,
-		                      &pipeline_schema_ready] {
-			std::exception_ptr parser_error;
-			try {
-				shared_ptr<RawCachedSchema> local_cached;
-				string batch;
-				while (pipeline.PopRaw(batch)) {
-					if (!local_cached && pipeline_schema_ready.load(std::memory_order_acquire)) {
-						lock_guard<mutex> guard(pipeline_schema_lock);
-						local_cached = pipeline_cached_schema;
-					}
-					shared_ptr<RawParsedPayload> parsed;
-					if (local_cached) {
-						parsed = RawParsedPayload::ProcessWithSchema(batch, options, local_cached);
-					} else {
-						parsed = RawParsedPayload::Process(batch, options);
-					}
-					pipeline.Push(RawIngestPipeline::Item {std::move(parsed), std::move(batch)});
-				}
-			} catch (...) {
-				parser_error = std::current_exception();
-			}
-			pipeline.ParserDone(parser_error);
-		});
+		parsers.emplace_back(
+		    [&pipeline, options, &pipeline_cached_schema, &pipeline_schema_lock, &pipeline_schema_ready] {
+			    std::exception_ptr parser_error;
+			    try {
+				    shared_ptr<RawCachedSchema> local_cached;
+				    string batch;
+				    while (pipeline.PopRaw(batch)) {
+					    if (!local_cached && pipeline_schema_ready.load(std::memory_order_acquire)) {
+						    lock_guard<mutex> guard(pipeline_schema_lock);
+						    local_cached = pipeline_cached_schema;
+					    }
+					    shared_ptr<RawParsedPayload> parsed;
+					    if (local_cached) {
+						    parsed = RawParsedPayload::ProcessWithSchema(batch, options, local_cached);
+					    } else {
+						    parsed = RawParsedPayload::Process(batch, options);
+					    }
+					    pipeline.Push(RawIngestPipeline::Item {std::move(parsed), std::move(batch)});
+				    }
+			    } catch (...) {
+				    parser_error = std::current_exception();
+			    }
+			    pipeline.ParserDone(parser_error);
+		    });
 	}
 	auto join_all = [&] {
 		reader.join();
