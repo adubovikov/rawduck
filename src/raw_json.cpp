@@ -516,8 +516,8 @@ shared_ptr<RawParsedPayload> RawParsedPayload::Process(const string &payload_tex
 }
 
 shared_ptr<RawParsedPayload> RawParsedPayload::ProcessWithSchema(const string &payload_text,
-                                                                  const RawParseOptions &options,
-                                                                  const shared_ptr<RawCachedSchema> &cached) {
+                                                                 const RawParseOptions &options,
+                                                                 const shared_ptr<RawCachedSchema> &cached) {
 	auto result = make_shared_ptr<RawParsedPayload>();
 	result->payload.Parse(payload_text, options);
 	result->root_shared = cached->root;

@@ -122,8 +122,7 @@ struct RawParsedPayload {
 	static shared_ptr<RawParsedPayload> Process(const string &payload_text,
 	                                            const RawParseOptions &options = RawParseOptions());
 	// fast path: skip inference, reuse cached schema
-	static shared_ptr<RawParsedPayload> ProcessWithSchema(const string &payload_text,
-	                                                      const RawParseOptions &options,
+	static shared_ptr<RawParsedPayload> ProcessWithSchema(const string &payload_text, const RawParseOptions &options,
 	                                                      const shared_ptr<RawCachedSchema> &cached);
 };
 
